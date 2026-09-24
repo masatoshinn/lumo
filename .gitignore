@@ -1,0 +1,27 @@
+# .NET build outputs
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.dll
+*.pdb
+*.exe
+*.deps.json
+
+# IDE
+.vs/
+.idea/
+*.swp
+
+# NuGet
+*.nupkg
+packages/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Build logs
+*.log
+MSBuild_*.failure.txt

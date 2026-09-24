@@ -1,0 +1,36 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Lumo.Editor</RootNamespace>
+    <AssemblyName>Lumo.Editor</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWarn>NU1903</NoWarn>
+    <AvaloniaUseDownoadedNativeAssets>true</AvaloniaUseDownoadedNativeAssets>
+    <AvaloniaBuildServicesDisabled>true</AvaloniaBuildServicesDisabled>
+    <UsedAvaloniaProducts></UsedAvaloniaProducts>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Lumo.Engine\Lumo.Engine.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.2.3" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.2.3" />
+    <PackageReference Include="Silk.NET.OpenGL" Version="2.22.0" />
+    <PackageReference Include="Silk.NET.Windowing" Version="2.22.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\lumo_logo_transparent.png" />
+    <EmbeddedResource Include="Assets\lumo_icon.png" />
+    <EmbeddedResource Include="Assets\lumo_splash.png" />
+  </ItemGroup>
+
+</Project>
