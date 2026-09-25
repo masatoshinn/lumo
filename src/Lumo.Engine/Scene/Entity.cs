@@ -19,6 +19,7 @@ public sealed class Entity
     public SpriteRendererComponent? SpriteRenderer { get; set; }
     public CameraComponent? Camera { get; set; }
     public LightComponent? Light { get; set; }
+    public Lumo.Engine.Scripting.ScriptComponent? Scripts { get; set; }
 
     public Entity() { }
 
@@ -54,6 +55,7 @@ public sealed class Entity
             Type t when t == typeof(SpriteRendererComponent) => SpriteRenderer as T,
             Type t when t == typeof(CameraComponent) => Camera as T,
             Type t when t == typeof(LightComponent) => Light as T,
+            Type t when t == typeof(Lumo.Engine.Scripting.ScriptComponent) => Scripts as T,
             _ => null
         };
     }
@@ -73,6 +75,7 @@ public sealed class Entity
             case SpriteRendererComponent c: SpriteRenderer = c; break;
             case CameraComponent c: Camera = c; break;
             case LightComponent c: Light = c; break;
+            case Lumo.Engine.Scripting.ScriptComponent c: Scripts = c; break;
         }
     }
 
@@ -85,6 +88,7 @@ public sealed class Entity
             Type t when t == typeof(SpriteRendererComponent) => SpriteRenderer != null,
             Type t when t == typeof(CameraComponent) => Camera != null,
             Type t when t == typeof(LightComponent) => Light != null,
+            Type t when t == typeof(Lumo.Engine.Scripting.ScriptComponent) => Scripts != null,
             _ => false
         };
     }

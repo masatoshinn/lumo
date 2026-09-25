@@ -39,6 +39,8 @@ public class GlViewport : Control
     private readonly System.Collections.Generic.List<(Matrix4x4 transform, Vector4 color)> _objects = [];
     private int _gridLineCount;
 
+    public bool IsReady => _initialized && _gl != null && _window != null;
+
     public GlViewport()
     {
         ClipToBounds = true;

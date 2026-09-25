@@ -45,6 +45,9 @@ public sealed class Scene
             _allEntities.Add(entity);
     }
 
+    /// <summary>Register a deserialized entity so it appears in AllEntities.</summary>
+    internal void RegisterLoadedEntity(Entity entity) => OnEntityAdded(entity);
+
     public Entity? FindByName(string name)
     {
         return _allEntities.FirstOrDefault(e => e.Name == name);
@@ -119,6 +122,7 @@ public sealed class EntityData
     public MeshRendererData? MeshRenderer { get; set; }
     public CameraData? Camera { get; set; }
     public LightData? Light { get; set; }
+    public ScriptsData? Scripts { get; set; }
     public long? ParentId { get; set; }
 }
 
@@ -149,4 +153,10 @@ public sealed class LightData
     public string LightType { get; set; } = "Directional";
     public float Intensity { get; set; } = 1.0f;
     public float[] Color { get; set; } = [1, 1, 1];
+}
+
+public sealed class ScriptsData
+{
+    public bool Enabled { get; set; } = true;
+    public List<string> ScriptNames { get; set; } = [];
 }

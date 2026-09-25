@@ -68,6 +68,15 @@ public static class SceneSerializer
             };
         }
 
+        if (entity.Scripts != null)
+        {
+            entityData.Scripts = new ScriptsData
+            {
+                Enabled = entity.Scripts.Enabled,
+                ScriptNames = [.. entity.Scripts.ScriptNames]
+            };
+        }
+
         list.Add(entityData);
 
         foreach (var child in entity.Children)
@@ -147,6 +156,16 @@ public static class SceneSerializer
                         entityData.Light.Color[2])
                 };
             }
+
+            if (entityData.Scripts != null)
+            {
+                var sc = new Lumo.Engine.Scripting.ScriptComponent
+                {
+                    Enabled = entityData.Scripts.Enabled
+                };
+                sc.ScriptNames.AddRange(entityData.Scripts.ScriptNames);
+                entity.Scripts = sc;
+            }
         }
 
         // Second pass: set up hierarchy
@@ -163,6 +182,10 @@ public static class SceneSerializer
                 scene.RootEntities.Add(entityMap[entityData.Id]);
             }
         }
+
+        // Populate AllEntities — without this, loaded scenes appear empty.
+        foreach (var entity in entityMap.Values)
+            scene.RegisterLoadedEntity(entity);
 
         return scene;
     }

@@ -1,29 +1,36 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
+using Avalonia.Platform.Storage;
 using Lumo.Editor.Rendering;
+using Lumo.Editor.Ui;
+using Lumo.Engine.Assets;
 using Lumo.Engine.Core;
 using Lumo.Engine.Rendering.Abstractions;
 using Lumo.Engine.Scene;
+using Lumo.Engine.Scripting;
 using System;
+using System.Collections.Generic;
 using System.IO;
-using System.Reflection;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Timers;
-using System.Linq;
-using System.Collections.Generic;
 using Timer = System.Timers.Timer;
+using LumoInput = Lumo.Engine.Input.InputState;
+using LumoKey = Lumo.Engine.Input.Key;
+using SceneType = Lumo.Engine.Scene.Scene;
 
 namespace Lumo.Editor.Views;
 
 public class WorkView : UserControl
 {
     private readonly LumoEngine _engine;
-    private Scene _scene;
+    private SceneType _scene;
     private ProjectInfo _project;
     private readonly Action<string?> _onNavigateHome;
     private readonly Action _onClose;
@@ -34,43 +41,52 @@ public class WorkView : UserControl
     private StackPanel _hierarchyList = null!;
     private StackPanel _inspectorContent = null!;
     private TextBlock _consoleLog = null!;
+    private ContentControl _bottomHost = null!;
+    private StackPanel _bottomTabsPanel = null!;
+    private StackPanel _sidebarNav = null!;
+    private Panel _viewportPanel = null!;
+    private Button _playButton = null!;
     private GlViewport? _glViewport;
+    private SoftwareViewport? _softwareViewport;
     private Entity? _selectedEntity;
     private bool _isPlaying;
-    private bool _is2DMode;
-    private readonly System.Collections.Generic.List<string> _logMessages = [];
-
-    private static readonly Color UE_Dark = Color.Parse("#1e1e1e");
-    private static readonly Color UE_Panel = Color.Parse("#2b2b2b");
-    private static readonly Color UE_PanelHeader = Color.Parse("#333333");
-    private static readonly Color UE_Border = Color.Parse("#1a1a1a");
-    private static readonly Color UE_Selection = Color.Parse("#264f78");
-    private static readonly Color UE_Hover = Color.Parse("#3a3a3a");
-    private static readonly Color UE_ToolbarHover = Color.Parse("#454545");
-    private static readonly Color UE_TextNormal = Color.Parse("#cccccc");
-    private static readonly Color UE_TextDim = Color.Parse("#888888");
-    private static readonly Color UE_TextBright = Color.Parse("#ffffff");
-    private static readonly Color UE_AccentBlue = Color.Parse("#3d9cd2");
-    private static readonly Color UE_Green = Color.Parse("#5fa84e");
-    private static readonly Color UE_Orange = Color.Parse("#d4a040");
-    private static readonly Color UE_Red = Color.Parse("#cc4444");
-    private static readonly Color UE_Purple = Color.Parse("#9966bb");
-    private static readonly Color UE_Cyan = Color.Parse("#5cc9c9");
+    private ViewportMode _viewMode = ViewportMode.Scene;
+    private string _activeSidebar = "Scene";
+    private string _bottomTab = "Project";
+    private string _selectedFolder = "";
+    private string _hierarchySearch = "";
+    private string _activeTool = "Move";
+    private bool _showGrid = true;
+    private bool _showGizmos = true;
+    private bool _showStats = true;
+    private readonly List<string> _logMessages = [];
+    private string? _playSnapshot;
+    private string? _currentScriptPath;
+    private TextBox? _scriptEditor;
+    private TextBlock? _scriptErrorText;
+    private TextBlock? _profilerStats = null!;
+    private LumoInput? _playInput;
+    private readonly ScriptHost _scriptHost = new();
 
     public WorkView(ProjectInfo project, Action<string?> onNavigateHome, Action onClose)
     {
         _project = project;
         _onNavigateHome = onNavigateHome;
         _onClose = onClose;
+        Focusable = true;
         _engine = new LumoEngine();
         _engine.Initialize();
-        _scene = new Scene { Name = project.Name };
+        _scene = new SceneType { Name = project.Name };
+
+        ScriptHost.MessageLogged += OnScriptMessage;
 
         LoadProject();
         BuildUI();
         StartFpsTimer();
         Log("Editor loaded.");
     }
+
+    private void OnScriptMessage(string message) => Log(message);
 
     private void LoadProject()
     {
@@ -86,8 +102,7 @@ public class WorkView : UserControl
     {
         var scenesDir = Path.Combine(_project.Path, "Scenes");
         Directory.CreateDirectory(scenesDir);
-        var sceneFile = Path.Combine(scenesDir, "scene.json");
-        _scene.Save(sceneFile);
+        _scene.Save(Path.Combine(scenesDir, "scene.json"));
         ProjectManager.UpdateLastModified(_project.Path);
     }
 
@@ -95,260 +110,777 @@ public class WorkView : UserControl
     {
         var timer = new Timer(500);
         timer.Elapsed += (_, _) =>
-        {
             Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             {
                 _fpsText.Text = $"FPS: {_engine.Time.FPS:F0}";
-                _entityCountText.Text = $"Objects: {_scene.AllEntities.Count}";
+                _entityCountText.Text = $"{_scene.AllEntities.Count} objects";
+                if (_profilerStats != null)
+                {
+                    _profilerStats.Text =
+                        $"FPS: {_engine.Time.FPS:F0}\n" +
+                        $"Frame: {_engine.Time.DeltaTime * 1000f:F2} ms\n" +
+                        $"Entities: {_scene.AllEntities.Count}\n" +
+                        $"Scripts: {_scriptHost.InstanceCount}\n" +
+                        $"Playing: {(_isPlaying ? "Yes" : "No")}";
+                }
             });
-        };
         timer.Start();
 
         var renderTimer = new Timer(16.0);
         renderTimer.Elapsed += (_, _) =>
-        {
-            if (_glViewport != null && _glViewport.IsVisible)
+            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             {
-                _glViewport.SetSceneObjects(_scene);
-                _glViewport.RenderFrame();
-            }
-        };
+                float dt = _engine.Tick();
+
+                if (_isPlaying)
+                {
+                    _playInput?.BeginFrame();
+                    _scriptHost.Update(dt, (float)_engine.Time.ElapsedTime);
+                }
+
+                if (_glViewport != null && _glViewport.IsVisible && _glViewport.IsReady)
+                {
+                    _glViewport.SetSceneObjects(_scene);
+                    _glViewport.RenderFrame();
+                }
+                else if (_softwareViewport != null && _softwareViewport.IsVisible)
+                {
+                    _softwareViewport.SetScene(_scene);
+                    _softwareViewport.InvalidateVisual();
+                }
+            }, Avalonia.Threading.DispatcherPriority.Render);
         renderTimer.Start();
     }
 
+    // ================= Play mode =================
+    private void TogglePlay()
+    {
+        if (!_isPlaying) StartPlay();
+        else StopPlay();
+        RefreshPlayButton();
+    }
+
+    private void StartPlay()
+    {
+        // Snapshot scene so Stop can restore editor state.
+        try { _playSnapshot = _scene.Serialize(); }
+        catch { _playSnapshot = null; }
+
+        var scriptsDir = Path.Combine(_project.Path, "Scripts");
+        Directory.CreateDirectory(scriptsDir);
+        var sources = Directory.GetFiles(scriptsDir, "*.cs", SearchOption.AllDirectories)
+            .Select(File.ReadAllText)
+            .ToList();
+
+        if (sources.Count > 0)
+        {
+            if (!_scriptHost.Compile(sources))
+            {
+                foreach (var err in _scriptHost.Errors)
+                    Log($"CS: {err}");
+                Log($"Script compile failed ({_scriptHost.Errors.Count} error(s)). Fix and retry.");
+                _playSnapshot = null;
+                return;
+            }
+
+            _playInput = new LumoInput();
+            _scriptHost.Input = _playInput;
+            _scriptHost.Bind(_scene);
+
+            if (_scriptHost.Errors.Count > 0)
+            {
+                foreach (var err in _scriptHost.Errors)
+                    Log(err);
+            }
+        }
+
+        _engine.Start();
+        _scriptHost.Start((float)_engine.Time.ElapsedTime);
+        _isPlaying = true;
+        Log(sources.Count > 0
+            ? $"Playing — {sources.Count} script file(s), {_scriptHost.InstanceCount} instance(s)."
+            : "Playing (no scripts in Scripts/).");
+    }
+
+    private void StopPlay()
+    {
+        _scriptHost.Stop();
+        _engine.Stop();
+        _isPlaying = false;
+
+        // Restore scene to pre-play state.
+        if (_playSnapshot != null)
+        {
+            try
+            {
+                var data = JsonSerializer.Deserialize<SceneData>(_playSnapshot,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (data != null)
+                {
+                    _scene = SceneSerializer.Deserialize(data);
+                    if (_selectedEntity != null)
+                        _selectedEntity = _scene.FindById(_selectedEntity.Id);
+                    RefreshHierarchy();
+                    RefreshInspector();
+                }
+            }
+            catch (Exception ex) { Log($"Restore failed: {ex.Message}"); }
+            _playSnapshot = null;
+        }
+
+        _playInput = null;
+        _scriptHost.Input = null;
+        Log("Stopped — scene restored.");
+    }
+
+    private void RefreshPlayButton()
+    {
+        if (_playButton == null) return;
+        _playButton.Content = UiTheme.ActionButton(
+            _isPlaying ? "Stop" : "Play",
+            _isPlaying ? Icons.Stop : Icons.Play,
+            null, primary: true).Content;
+        _playButton.Background = UiTheme.B(_isPlaying ? UiTheme.Red : UiTheme.Accent);
+    }
+
+    // ================= UI =================
     private void BuildUI()
     {
-        var root = new DockPanel();
+        _consoleLog = new TextBlock { Text = "", Foreground = UiTheme.B(UiTheme.Green), FontFamily = UiTheme.Mono, FontSize = 11, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(10, 8) };
 
-        var menuBar = BuildMenuBar();
-        DockPanel.SetDock(menuBar, Dock.Top);
-        root.Children.Add(menuBar);
+        var root = new DockPanel { Background = UiTheme.B(UiTheme.Bg) };
 
-        var toolbar = BuildToolbar();
-        DockPanel.SetDock(toolbar, Dock.Top);
-        root.Children.Add(toolbar);
+        var topbar = BuildTopBar();
+        DockPanel.SetDock(topbar, Dock.Top);
+        root.Children.Add(topbar);
 
-        var statusBar = BuildStatusBar();
-        DockPanel.SetDock(statusBar, Dock.Bottom);
-        root.Children.Add(statusBar);
+        var sidebar = BuildSidebar();
+        DockPanel.SetDock(sidebar, Dock.Left);
+        root.Children.Add(sidebar);
 
-        var center = new DockPanel();
+        var status = BuildStatusBar();
+        DockPanel.SetDock(status, Dock.Bottom);
+        root.Children.Add(status);
 
-        var bottomPanel = BuildBottomPanel();
-        DockPanel.SetDock(bottomPanel, Dock.Bottom);
-        center.Children.Add(bottomPanel);
-
-        var contentRow = BuildContent();
-        center.Children.Add(contentRow);
-
-        root.Children.Add(center);
+        root.Children.Add(BuildEditorArea());
         Content = root;
     }
 
-    private Menu BuildMenuBar()
+    // ---------- Top bar ----------
+    private Control BuildTopBar()
     {
-        var menu = new Menu { Background = new SolidColorBrush(UE_Panel), FontSize = 12 };
-
-        var file = new MenuItem { Header = "_File" };
-        file.Items.Add(MakeMenuItem("_New", () => Log("New project.")));
-        file.Items.Add(MakeMenuItem("_Open...", () => Log("Open project...")));
-        file.Items.Add(MakeMenuItem("Save", () => { SaveProject(); Log("Saved."); }));
-        file.Items.Add(new Separator());
-        file.Items.Add(MakeMenuItem("Export Scene as OBJ...", ExportSceneAsObj));
-        file.Items.Add(MakeMenuItem("Import OBJ...", ImportObj));
-        file.Items.Add(new Separator());
-        file.Items.Add(MakeMenuItem("_Home", () => _onNavigateHome?.Invoke(null)));
-        file.Items.Add(new Separator());
-        file.Items.Add(MakeMenuItem("E_xit", () => _onClose()));
-        menu.Items.Add(file);
-
-        var edit = new MenuItem { Header = "_Edit" };
-        edit.Items.Add(MakeMenuItem("_Undo    Ctrl+Z", () => Log("Undo.")));
-        edit.Items.Add(MakeMenuItem("_Redo    Ctrl+Y", () => Log("Redo.")));
-        edit.Items.Add(new Separator());
-        edit.Items.Add(MakeMenuItem("_Duplicate    Ctrl+D", DuplicateSelected));
-        edit.Items.Add(MakeMenuItem("_Delete    Del", DeleteSelected));
-        menu.Items.Add(edit);
-
-        var create = new MenuItem { Header = "_Create" };
-        create.Items.Add(MakeMenuItem("_Empty Actor", () => CreateEntity("Empty")));
-        create.Items.Add(MakeMenuItem("_Cube", () => CreateEntityWithMesh("Cube", "Cube")));
-        create.Items.Add(MakeMenuItem("_Sphere", () => CreateEntityWithMesh("Sphere", "Sphere")));
-        create.Items.Add(new Separator());
-        create.Items.Add(MakeMenuItem("_Camera", CreateCamera));
-        create.Items.Add(MakeMenuItem("Directional _Light", CreateLight));
-        create.Items.Add(MakeMenuItem("_Point Light", CreatePointLight));
-        menu.Items.Add(create);
-
-        var help = new MenuItem { Header = "_Help" };
-        help.Items.Add(MakeMenuItem("_About Lumo Engine", () => Log($"{EngineConstants.Name} v{EngineConstants.Version}")));
-        menu.Items.Add(help);
-
-        return menu;
-    }
-
-    private MenuItem MakeMenuItem(string header, Action onClick)
-    {
-        var item = new MenuItem { Header = header };
-        item.Click += (_, _) => onClick();
-        return item;
-    }
-
-    private Panel BuildToolbar()
-    {
-        var bar = new StackPanel
+        var left = new StackPanel
         {
             Orientation = Orientation.Horizontal,
-            Background = new SolidColorBrush(UE_Panel),
-            Spacing = 0,
-            Margin = new Thickness(4, 2),
+            Spacing = 8,
             VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(12, 0),
+            Children =
+            {
+                UiTheme.Logo(22),
+                UiTheme.IconBtn(Icons.Home, () => _onNavigateHome?.Invoke(null)),
+                new Border
+                {
+                    Background = UiTheme.B(UiTheme.Card),
+                    BorderBrush = UiTheme.B(UiTheme.Border),
+                    BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(7),
+                    Padding = new Thickness(11, 6),
+                    Cursor = new Cursor(StandardCursorType.Hand),
+                    Child = new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Spacing = 8,
+                        Children =
+                        {
+                            UiTheme.Ico(Icons.Cube, 14, UiTheme.Cyan),
+                            UiTheme.Txt(_project.Name, 12, UiTheme.Text, FontWeight.Medium),
+                            UiTheme.Ico(Icons.ChevronDown, 13, UiTheme.Dim),
+                        }
+                    },
+                },
+            }
         };
 
-        try
+        _playButton = UiTheme.ActionButton("Play", Icons.Play, () => TogglePlay(), primary: true);
+        _playButton.Padding = new Thickness(18, 7);
+        _playButton.HorizontalAlignment = HorizontalAlignment.Left;
+
+        var platform = new Border
         {
-            var assembly = Assembly.GetExecutingAssembly();
-            using var stream = assembly.GetManifestResourceStream("Lumo.Editor.Assets.lumo_icon.png");
-            if (stream != null)
+            Background = UiTheme.B(UiTheme.Card),
+            BorderBrush = UiTheme.B(UiTheme.Border),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(7),
+            Padding = new Thickness(11, 7),
+            Child = new StackPanel
             {
-                bar.Children.Add(new Image
-                {
-                    Source = new Bitmap(stream),
-                    Width = 20, Height = 20,
-                    Margin = new Thickness(4, 0, 10, 0),
-                    VerticalAlignment = VerticalAlignment.Center
-                });
+                Orientation = Orientation.Horizontal,
+                Spacing = 7,
+                Children = { UiTheme.Ico(Icons.Monitor, 14, UiTheme.Dim), UiTheme.Txt("Windows (x64)", 12, UiTheme.Text), UiTheme.Ico(Icons.ChevronDown, 13, UiTheme.Dim) },
+            },
+            Cursor = new Cursor(StandardCursorType.Hand),
+        };
+
+        var right = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 14, 0),
+            Children =
+            {
+                _playButton,
+                platform,
+                UiTheme.IconBtn(Icons.Rocket, BuildProject),
+                UiTheme.IconBtn(Icons.Gear, OpenSettings),
+                UiTheme.IconBtn(Icons.Help, () => Log($"{EngineConstants.Name} v{EngineConstants.Version}")),
+                BuildUserChip(),
             }
-        }
-        catch { }
+        };
+        DockPanel.SetDock(right, Dock.Right);
 
-        FlatToolBtn(bar, "New", new PathIcon { Data = Geometry.Parse("M12 5v14M5 12h14") }, () => Log("New level."));
-        FlatToolBtn(bar, "Open", new PathIcon { Data = Geometry.Parse("M19 19H5V5h7V3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z") }, () => Log("Open level."));
-        FlatToolBtn(bar, "Save", new PathIcon { Data = Geometry.Parse("M17 3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z") }, () => { SaveProject(); Log("Saved."); });
-        ToolSep(bar);
-        FlatToolBtn(bar, "Undo", new PathIcon { Data = Geometry.Parse("M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z") }, () => Log("Undo."));
-        FlatToolBtn(bar, "Redo", new PathIcon { Data = Geometry.Parse("M18.4 10.6C16.55 8.99 14.15 8 12.5 8c-4.65 0-8.58 3.03-9.96 7.22L3.9 16c1.05-3.19 4.05-5.5 7.6-5.5 1.95 0 3.73.72 5.12 1.88L13 16h9V7h-3.6l1 1.5z") }, () => Log("Redo."));
-        ToolSep(bar);
-
-        Button? playBtn = null;
-        playBtn = FlatToolBtn(bar, "Play", new PathIcon { Data = Geometry.Parse("M8 5v14l11-7z") }, () =>
-        {
-            _isPlaying = !_isPlaying;
-            if (playBtn != null) playBtn.Content = _isPlaying ? new TextBlock { Text = "Stop" } : new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Children = { new PathIcon { Data = Geometry.Parse("M8 5v14l11-7z") }, new TextBlock { Text = "Play" } } };
-            Log(_isPlaying ? "PIE started." : "PIE stopped.");
-            _statusText.Text = _isPlaying ? "Simulating" : "Ready";
-        });
-        FlatToolBtn(bar, "Pause", new PathIcon { Data = Geometry.Parse("M6 19h4V5H6v14zm8-14v14h4V5h-4z") }, () => Log("Paused."));
-        ToolSep(bar);
-
-        Button? modeBtn = null;
-        modeBtn = FlatToolBtn(bar, "3D", new PathIcon { Data = Geometry.Parse("M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z") }, () =>
-        {
-            _is2DMode = !_is2DMode;
-            if (modeBtn != null) modeBtn.Content = _is2DMode ? new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Children = { new PathIcon { Data = Geometry.Parse("M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z") }, new TextBlock { Text = "3D" } } } : new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Children = { new PathIcon { Data = Geometry.Parse("M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z") }, new TextBlock { Text = "2D" } } };
-            Log($"View: {(_is2DMode ? "2D" : "3D")}");
-        });
-        ToolSep(bar);
-
-        FlatToolBtn(bar, "Cube", new PathIcon { Data = Geometry.Parse("M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5") }, () => CreateEntityWithMesh("Cube", "Cube"));
-        FlatToolBtn(bar, "Light", new PathIcon { Data = Geometry.Parse("M9 21c0 .5.4 1 1 1h4c.6 0 1-.5 1-1v-1H9v1zm3-19C8.1 2 5 5.1 5 9c0 2.4 1.2 4.5 3 5.7V17c0 .5.4 1 1 1h6c.6 0 1-.5 1-1v-2.3c1.8-1.3 3-3.4 3-5.7 0-3.9-3.1-7-7-7z") }, () => CreateLight());
-        FlatToolBtn(bar, "Camera", new PathIcon { Data = Geometry.Parse("M12 15c-1.7 0-3-1.3-3-3s1.3-3 3-3 3 1.3 3 3-1.3 3-3 3zm1-9H9V3h4v3z") }, () => CreateCamera());
-
-        return bar;
+        var bar = new DockPanel { Height = 52, Background = UiTheme.B(UiTheme.Sidebar), Children = { right, left } };
+        return new Border { BorderBrush = UiTheme.B(UiTheme.Border), BorderThickness = new Thickness(0, 0, 0, 1), Child = bar };
     }
 
-    private Button FlatToolBtn(Panel bar, string label, Control icon, Action onClick)
+    private Control BuildUserChip()
     {
+        return new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 9,
+            Margin = new Thickness(8, 0, 0, 0),
+            Children =
+            {
+                new Border
+                {
+                    Width = 30, Height = 30, CornerRadius = new CornerRadius(15),
+                    Background = new LinearGradientBrush
+                    {
+                        StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
+                        EndPoint = new RelativePoint(1, 1, RelativeUnit.Relative),
+                        GradientStops = { new GradientStop(UiTheme.Accent, 0), new GradientStop(UiTheme.Purple, 1) },
+                    },
+                    Child = UiTheme.Txt("G", 13, Colors.White, FontWeight.Bold),
+                },
+                new StackPanel
+                {
+                    Spacing = -1,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Children =
+                    {
+                        UiTheme.Txt("Golam Mostofa Sadhin", 12, UiTheme.Text, FontWeight.SemiBold),
+                        UiTheme.Txt("Creator", 10, UiTheme.Faint),
+                    }
+                },
+                UiTheme.Ico(Icons.ChevronDown, 14, UiTheme.Dim),
+            }
+        };
+    }
+
+    // ---------- Sidebar ----------
+    private Control BuildSidebar()
+    {
+        var side = new StackPanel { Width = 226, Background = UiTheme.B(UiTheme.Sidebar) };
+
+        side.Children.Add(new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 10,
+            Margin = new Thickness(16, 14, 16, 18),
+            Children =
+            {
+                UiTheme.Logo(24),
+                new StackPanel { Spacing = -2, Children = { UiTheme.Txt("Lumo", 17, UiTheme.Text, FontWeight.Bold), UiTheme.Txt("Game Engine", 9, UiTheme.Faint) } },
+            }
+        });
+
+        side.Children.Add(SideLabel("Project"));
+        _sidebarNav = new StackPanel();
+        RebuildSidebarNav();
+        side.Children.Add(_sidebarNav);
+
+        side.Children.Add(SideLabel("Quick Actions"));
+        var actions = new StackPanel();
+        foreach (var (icon, name, act) in new (string, string, Action)[]
+        {
+            (Icons.FilePlus, "New Scene", NewScene),
+            (Icons.Upload, "Import Asset", () => _ = ImportAssetAsync()),
+            (Icons.Code, "Add Script", AddScript),
+            (Icons.Rocket, "Build Project", BuildProject),
+        })
+        {
+            var b = new Border
+            {
+                Margin = new Thickness(10, 3),
+                Padding = new Thickness(12, 9),
+                CornerRadius = new CornerRadius(8),
+                Background = UiTheme.B(UiTheme.Card),
+                BorderBrush = UiTheme.B(UiTheme.Border),
+                BorderThickness = new Thickness(1),
+                Cursor = new Cursor(StandardCursorType.Hand),
+                Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, Children = { UiTheme.Ico(icon, 15, UiTheme.Cyan), UiTheme.Txt(name, 12, UiTheme.Text) } },
+            };
+            b.PointerEntered += (_, _) => b.Background = UiTheme.B(UiTheme.CardHover);
+            b.PointerExited += (_, _) => b.Background = UiTheme.B(UiTheme.Card);
+            b.PointerPressed += (_, _) => act();
+            actions.Children.Add(b);
+        }
+        side.Children.Add(actions);
+
+        // promo
+        side.Children.Add(new Border
+        {
+            Margin = new Thickness(12, 16, 12, 8),
+            CornerRadius = new CornerRadius(10),
+            Padding = new Thickness(14, 16),
+            Background = new LinearGradientBrush
+            {
+                StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
+                EndPoint = new RelativePoint(1, 1, RelativeUnit.Relative),
+                GradientStops = { new GradientStop(Color.Parse("#1b2559"), 0), new GradientStop(Color.Parse("#2a1b52"), 1) },
+            },
+            Child = new StackPanel
+            {
+                Spacing = 6,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Children =
+                {
+                    UiTheme.Logo(26),
+                    UiTheme.TxtAt("Build Worlds", 13, UiTheme.Text, FontWeight.Bold, HorizontalAlignment.Center),
+                    UiTheme.TxtAt("Create Stories", 13, UiTheme.Text, FontWeight.Bold, HorizontalAlignment.Center),
+                    new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Spacing = 6,
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        Margin = new Thickness(0, 6, 0, 0),
+                        Children = { UiTheme.Logo(13), UiTheme.Txt("Lumo", 12, UiTheme.Text, FontWeight.SemiBold) },
+                    },
+                }
+            }
+        });
+
+        side.Children.Add(new Border
+        {
+            Height = 26,
+            Background = UiTheme.B(UiTheme.Panel),
+            Child = new DockPanel
+            {
+                Children =
+                {
+                    new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal, Spacing = 6,
+                        Margin = new Thickness(14, 0),
+                        VerticalAlignment = VerticalAlignment.Center,
+                        Children =
+                        {
+                            new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4), Background = UiTheme.B(UiTheme.Green), VerticalAlignment = VerticalAlignment.Center },
+                            UiTheme.Txt("Online", 10, UiTheme.Green),
+                        }
+                    },
+                    new TextBlock
+                    {
+                        Text = "v0.1.0 (Beta)",
+                        FontSize = 10,
+                        Foreground = UiTheme.B(UiTheme.Faint),
+                        VerticalAlignment = VerticalAlignment.Center,
+                        Margin = new Thickness(0, 0, 14, 0),
+                        HorizontalAlignment = HorizontalAlignment.Right,
+                    }
+                }
+            }
+        });
+
+        return side;
+    }
+
+    private static TextBlock SideLabel(string text)
+        => new() { Text = text, FontSize = 10, Foreground = UiTheme.B(UiTheme.Faint), FontWeight = FontWeight.SemiBold, Margin = new Thickness(22, 10, 0, 5), LetterSpacing = 1.2 };
+
+    private Control SideBtn(string icon, string label)
+    {
+        bool active = label == _activeSidebar;
         var btn = new Button
         {
             Content = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
-                Spacing = 4,
-                Children = { icon, new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center } }
+                Spacing = 12,
+                VerticalAlignment = VerticalAlignment.Center,
+                Children = { UiTheme.Ico(icon, 15, active ? Color.Parse("#8fa4ff") : UiTheme.Dim), UiTheme.Txt(label, 12, active ? UiTheme.Text : UiTheme.Dim, active ? FontWeight.SemiBold : FontWeight.Normal) },
             },
-            Padding = new Thickness(6, 3),
-            Background = new SolidColorBrush(Colors.Transparent),
-            Foreground = new SolidColorBrush(UE_TextNormal),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            Padding = new Thickness(14, 8),
+            Margin = new Thickness(10, 1),
+            Background = active ? UiTheme.B(Color.Parse("#1c2a6b")) : UiTheme.B(Colors.Transparent),
+            Foreground = UiTheme.B(UiTheme.Dim),
             BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(7),
             Cursor = new Cursor(StandardCursorType.Hand),
-            Margin = new Thickness(1, 0),
         };
-        btn.PointerEntered += (_, _) => { btn.Background = new SolidColorBrush(UE_ToolbarHover); btn.Foreground = new SolidColorBrush(UE_TextBright); };
-        btn.PointerExited += (_, _) => { btn.Background = new SolidColorBrush(Colors.Transparent); btn.Foreground = new SolidColorBrush(UE_TextNormal); };
-        btn.Click += (_, _) => onClick();
-        bar.Children.Add(btn);
+        if (!active)
+        {
+            btn.PointerEntered += (_, _) => btn.Background = UiTheme.B(Color.Parse("#151d38"));
+            btn.PointerExited += (_, _) => btn.Background = UiTheme.B(Colors.Transparent);
+        }
+        btn.Click += (_, _) => SidebarNavigate(label);
         return btn;
     }
 
-    private void ToolSep(Panel bar)
+    private void RebuildSidebarNav()
     {
-        bar.Children.Add(new Border
+        if (_sidebarNav == null) return;
+        _sidebarNav.Children.Clear();
+        foreach (var (icon, name) in new[]
         {
-            Width = 1, Height = 16,
-            Background = new SolidColorBrush(UE_Border),
-            Margin = new Thickness(4, 0),
-            VerticalAlignment = VerticalAlignment.Center,
-        });
+            (Icons.Dashboard, "Overview"), (Icons.Scene, "Scene"), (Icons.Box, "Game Objects"),
+            (Icons.Folder, "Assets"), (Icons.Code, "Scripts"), (Icons.Rocket, "Build & Run"), (Icons.Gear, "Settings"),
+        })
+            _sidebarNav.Children.Add(SideBtn(icon, name));
     }
 
-    private Grid BuildContent()
+    private void SidebarNavigate(string label)
     {
-        var grid = new Grid
+        _activeSidebar = label;
+        RebuildSidebarNav();
+
+        switch (label)
+        {
+            case "Assets":
+                _bottomTab = "Project";
+                _selectedFolder = Path.Combine(_project.Path, "Assets");
+                RebuildBottom();
+                break;
+            case "Scripts":
+                _bottomTab = "Scripts";
+                RebuildBottom();
+                break;
+            case "Build & Run":
+                BuildProject();
+                break;
+            case "Settings":
+                OpenSettings();
+                break;
+            case "Game Objects":
+                _bottomTab = "Project";
+                RebuildBottom();
+                Log($"{_scene.AllEntities.Count} game objects in scene.");
+                break;
+            case "Scene":
+                _bottomTab = "Console";
+                RebuildBottom();
+                break;
+            case "Overview":
+                _onNavigateHome?.Invoke(null);
+                break;
+        }
+    }
+
+    // ---------- Editor area ----------
+    private Control BuildEditorArea()
+    {
+        // Scene tab strip
+        var sceneTab = new Border
+        {
+            Background = UiTheme.B(UiTheme.Panel),
+            BorderBrush = UiTheme.B(UiTheme.Border),
+            BorderThickness = new Thickness(1, 1, 1, 0),
+            CornerRadius = new CornerRadius(7, 7, 0, 0),
+            Padding = new Thickness(12, 7),
+            Child = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                Children =
+                {
+                    UiTheme.Ico(Icons.Scene, 13, UiTheme.Cyan),
+                    UiTheme.Txt($"{_project.Name}.scene", 12, UiTheme.Text, FontWeight.Medium),
+                    UiTheme.Ico(Icons.Close, 13, UiTheme.Faint),
+                }
+            },
+            Cursor = new Cursor(StandardCursorType.Hand),
+        };
+        var plusTab = new Button
+        {
+            Content = UiTheme.Ico(Icons.Plus, 14, UiTheme.Dim),
+            Background = UiTheme.B(Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(9, 5),
+            Cursor = new Cursor(StandardCursorType.Hand),
+        };
+
+        var tabBar = new Border
+        {
+            Background = UiTheme.B(UiTheme.Bg),
+            Padding = new Thickness(10, 6, 0, 0),
+            Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3, Children = { sceneTab, plusTab } },
+        };
+
+        // content: viewport | hierarchy | inspector
+        var viewport = BuildViewport();
+        var bottom = BuildBottomPanel();
+        var hierarchy = BuildHierarchyPanel();
+        var inspector = BuildInspectorPanel();
+
+        hierarchy.Width = 262;
+        inspector.Width = 318;
+
+        var leftCol = new Grid
+        {
+            RowDefinitions =
+            {
+                new RowDefinition(new GridLength(1, GridUnitType.Star)),
+                new RowDefinition(new GridLength(250)),
+            },
+            Children = { viewport, bottom },
+        };
+        Grid.SetRow(viewport, 0);
+        Grid.SetRow(bottom, 1);
+
+        var center = new Grid
         {
             ColumnDefinitions =
             {
-                new ColumnDefinition(new GridLength(260)),
-                new ColumnDefinition(new GridLength(3)),
                 new ColumnDefinition(new GridLength(1, GridUnitType.Star)),
-                new ColumnDefinition(new GridLength(3)),
-                new ColumnDefinition(new GridLength(300)),
-            }
+                new ColumnDefinition(new GridLength(1, GridUnitType.Auto)),
+                new ColumnDefinition(new GridLength(1, GridUnitType.Auto)),
+            },
+            Children = { leftCol, hierarchy, inspector },
         };
+        Grid.SetColumn(leftCol, 0);
+        Grid.SetColumn(hierarchy, 1);
+        Grid.SetColumn(inspector, 2);
 
-        var hierPanel = BuildHierarchyPanel();
-        Grid.SetColumn(hierPanel, 0);
-        grid.Children.Add(hierPanel);
-        grid.Children.Add(new Border { Background = new SolidColorBrush(UE_Border) });
-        Grid.SetColumn(grid.Children[^1], 1);
+        var inner = new Grid { RowDefinitions = { new RowDefinition(GridLength.Auto), new RowDefinition(new GridLength(1, GridUnitType.Star)) } };
+        Grid.SetRow(tabBar, 0);
+        Grid.SetRow(center, 1);
+        inner.Children.Add(tabBar);
+        inner.Children.Add(center);
 
-        var viewport = BuildViewport();
-        Grid.SetColumn(viewport, 2);
-        grid.Children.Add(viewport);
-        grid.Children.Add(new Border { Background = new SolidColorBrush(UE_Border) });
-        Grid.SetColumn(grid.Children[^1], 3);
-
-        var inspPanel = BuildInspectorPanel();
-        Grid.SetColumn(inspPanel, 4);
-        grid.Children.Add(inspPanel);
-
-        return grid;
+        return inner;
     }
 
-    private DockPanel BuildHierarchyPanel()
+    // ---------- Viewport ----------
+    private Control BuildViewport()
     {
-        _hierarchyList = new StackPanel { Spacing = 0 };
-        var scroll = new ScrollViewer { Content = _hierarchyList };
+        _glViewport = new GlViewport();
+        _softwareViewport = new SoftwareViewport();
+        _softwareViewport.Mode = _viewMode;
 
-        var searchBox = new TextBox
+        _viewportPanel = new Panel { Background = UiTheme.B(Color.Parse("#0b1020")) };
+
+        if (!_glViewport.IsReady)
         {
-            Watermark = "Search actors...",
-            FontSize = 11,
-            Height = 24,
-            Margin = new Thickness(4, 4, 4, 2),
-            Background = new SolidColorBrush(UE_Dark),
-            Foreground = new SolidColorBrush(UE_TextNormal),
-            BorderBrush = new SolidColorBrush(UE_Border),
-            BorderThickness = new Thickness(1),
+            _viewportPanel.Children.Add(_softwareViewport);
+            _glViewport.IsVisible = false;
+        }
+        else
+        {
+            _viewportPanel.Children.Add(_glViewport);
+            _softwareViewport.IsVisible = false;
+        }
+
+        _viewportPanel.Children.Add(BuildViewportOverlay());
+
+        _viewportPanel.AttachedToVisualTree += (_, _) =>
+            System.Threading.Tasks.Task.Delay(250).ContinueWith(_ =>
+                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                {
+                    if (_glViewport!.IsReady)
+                    {
+                        _softwareViewport!.IsVisible = false;
+                        _glViewport.IsVisible = true;
+                        Log("OpenGL viewport active.");
+                    }
+                    else
+                    {
+                        _softwareViewport!.IsVisible = true;
+                        _glViewport.IsVisible = false;
+                        Log("OpenGL unavailable — software renderer active.");
+                    }
+                }));
+
+        return _viewportPanel;
+    }
+
+    private void SetViewMode(ViewportMode mode)
+    {
+        if (_viewMode == mode) return;
+        _viewMode = mode;
+        if (_softwareViewport != null)
+        {
+            _softwareViewport.Mode = mode;
+            _softwareViewport.InvalidateVisual();
+        }
+        Log($"View: {mode switch { ViewportMode.Game => "Game", ViewportMode.Mode2D => "2D", _ => "Scene" }}");
+        InvalidateOverlay();
+    }
+
+    private Control BuildViewportOverlay()
+    {
+        // top-left: Scene / Game / 2D toggle
+        var segInner = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
+        void SegBtn(string label, ViewportMode mode)
+        {
+            bool on = _viewMode == mode;
+            var b = new Button
+            {
+                Content = UiTheme.Txt(label, 11, on ? Colors.White : UiTheme.Dim, on ? FontWeight.SemiBold : FontWeight.Normal),
+                Background = on ? UiTheme.B(UiTheme.Accent) : UiTheme.B(Colors.Transparent),
+                BorderThickness = new Thickness(0),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(13, 5),
+                Cursor = new Cursor(StandardCursorType.Hand),
+            };
+            b.Click += (_, _) => SetViewMode(mode);
+            segInner.Children.Add(b);
+        }
+        SegBtn("Scene", ViewportMode.Scene);
+        SegBtn("Game", ViewportMode.Game);
+        SegBtn("2D", ViewportMode.Mode2D);
+
+        var segHost = new Border { HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(12, 12, 0, 0), Background = UiTheme.B(Color.Parse("#e610172a")), CornerRadius = new CornerRadius(8), Padding = new Thickness(3), Child = segInner };
+
+        // left tool strip
+        var tools = new StackPanel { Orientation = Orientation.Vertical, Spacing = 4 };
+        foreach (var (ic, tool) in new[]
+        {
+            (Icons.MoveTool, "Move"), (Icons.Cube, "Rotate"), (Icons.Grid, "Scale"),
+            (Icons.Box, "Rect"), (Icons.Dots, "More"),
+        })
+        {
+            string t = tool;
+            bool activeTool = t == _activeTool;
+            var btn = UiTheme.IconBtn(ic, () => { _activeTool = t; Log($"Tool: {t}"); InvalidateOverlay(); }, 17,
+                activeTool ? UiTheme.Cyan : null);
+            tools.Children.Add(btn);
+        }
+        var toolsHost = new Border { HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(12, 62, 0, 0), Background = UiTheme.B(Color.Parse("#e610172a")), CornerRadius = new CornerRadius(9), Padding = new Thickness(5), Child = tools };
+
+        // top-right icon cluster
+        var rightIcons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3 };
+        rightIcons.Children.Add(UiTheme.IconBtn(Icons.Camera, CreateCamera, 15));
+        rightIcons.Children.Add(UiTheme.IconBtn(Icons.MoveTool, () => { _activeTool = "Move"; Log("Tool: Move"); InvalidateOverlay(); }, 15, _activeTool == "Move" ? UiTheme.Cyan : null));
+        rightIcons.Children.Add(UiTheme.IconBtn(Icons.Gear, OpenSettings, 15));
+        rightIcons.Children.Add(UiTheme.IconBtn(Icons.Bulb, () =>
+        {
+            _showGizmos = !_showGizmos;
+            if (_softwareViewport != null) { _softwareViewport.ShowGizmos = _showGizmos; _softwareViewport.InvalidateVisual(); }
+            Log($"Gizmos: {(_showGizmos ? "on" : "off")}");
+            InvalidateOverlay();
+        }, 15, _showGizmos ? UiTheme.Orange : null));
+        rightIcons.Children.Add(UiTheme.IconBtn(Icons.Grid, () =>
+        {
+            _showGrid = !_showGrid;
+            if (_softwareViewport != null) { _softwareViewport.ShowGrid = _showGrid; _softwareViewport.InvalidateVisual(); }
+            Log($"Grid: {(_showGrid ? "on" : "off")}");
+            InvalidateOverlay();
+        }, 15, _showGrid ? UiTheme.Cyan : null));
+        rightIcons.Children.Add(UiTheme.IconBtn(Icons.Monitor, () => { _showStats = !_showStats; Log($"Stats overlay: {(_showStats ? "on" : "off")}"); InvalidateOverlay(); }, 15, _showStats ? UiTheme.Cyan : null));
+        var rightHost = new Border { HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 12, 12, 0), Background = UiTheme.B(Color.Parse("#e610172a")), CornerRadius = new CornerRadius(8), Padding = new Thickness(5), Child = rightIcons };
+
+        // bottom-left projection chip (click toggles perspective/ortho in 3D)
+        string projLabel = _viewMode switch
+        {
+            ViewportMode.Mode2D => "Orthographic",
+            ViewportMode.Game => "Game Camera",
+            _ => "Perspective",
+        };
+        var persp = new Border
+        {
+            Background = UiTheme.B(Color.Parse("#10172acc")),
+            CornerRadius = new CornerRadius(7),
+            Padding = new Thickness(11, 6),
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Bottom,
+            Margin = new Thickness(12, 0, 0, 12),
+            Cursor = new Cursor(StandardCursorType.Hand),
+            Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, Children = { UiTheme.Ico(Icons.Grid, 13, UiTheme.Cyan), UiTheme.Txt(projLabel, 11, UiTheme.Text), UiTheme.Ico(Icons.ChevronDown, 12, UiTheme.Dim) } },
         };
 
-        var header = PanelHeader("WORLD OUTLINER");
+        // bottom-right hint
+        var hint = new TextBlock
+        {
+            Text = _viewMode == ViewportMode.Mode2D ? "LMB/MMB: Pan  |  Scroll: Zoom" : "LMB: Orbit  |  MMB: Pan  |  Scroll: Zoom",
+            FontSize = 10,
+            Foreground = UiTheme.B(UiTheme.Faint),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Bottom,
+            Margin = new Thickness(0, 0, 14, 14),
+            IsVisible = _showStats,
+        };
 
-        var panel = new DockPanel { Background = new SolidColorBrush(UE_Panel) };
+        // Root panel has no background, so empty areas pass clicks to the viewport.
+        return new Panel { Children = { segHost, toolsHost, rightHost, persp, hint } };
+    }
+
+    private void InvalidateOverlay()
+    {
+        if (_viewportPanel == null) return;
+        int last = _viewportPanel.Children.Count - 1;
+        if (last < 0) return;
+        _viewportPanel.Children.RemoveAt(last);
+        _viewportPanel.Children.Add(BuildViewportOverlay());
+    }
+
+    // ---------- Hierarchy ----------
+    private Control BuildHierarchyPanel()
+    {
+        _hierarchyList = new StackPanel { Spacing = 1 };
+        var scroll = new ScrollViewer { Content = _hierarchyList, Background = UiTheme.B(UiTheme.Panel) };
+
+        var header = new Border
+        {
+            Height = 34,
+            Background = UiTheme.B(UiTheme.Panel),
+            BorderBrush = UiTheme.B(UiTheme.Border),
+            BorderThickness = new Thickness(0, 0, 0, 1),
+            Padding = new Thickness(12, 0),
+            Child = new DockPanel
+            {
+                Children =
+                {
+                    UiTheme.IconBtn(Icons.Plus, () => CreateEntity("Empty Actor"), 14),
+                    new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Spacing = 8,
+                        VerticalAlignment = VerticalAlignment.Center,
+                        Children = { UiTheme.Ico(Icons.Cube, 15, UiTheme.Cyan), UiTheme.Txt("Hierarchy", 13, UiTheme.Text, FontWeight.SemiBold) },
+                    },
+                }
+            },
+        };
+        DockPanel.SetDock(header, Dock.Right);
+
+        var search = new TextBox
+        {
+            Watermark = "Search...",
+            FontSize = 11,
+            Height = 28,
+            Margin = new Thickness(10, 8, 10, 6),
+            Background = UiTheme.B(UiTheme.Bg),
+            Foreground = UiTheme.B(UiTheme.Text),
+            BorderBrush = UiTheme.B(UiTheme.Border),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(9, 4),
+        };
+        search.TextChanged += (_, _) =>
+        {
+            _hierarchySearch = search.Text ?? "";
+            RefreshHierarchy();
+        };
+
+        var panel = new DockPanel { Background = UiTheme.B(UiTheme.Panel) };
         DockPanel.SetDock(header, Dock.Top);
-        DockPanel.SetDock(searchBox, Dock.Top);
+        DockPanel.SetDock(search, Dock.Top);
         panel.Children.Add(header);
-        panel.Children.Add(searchBox);
+        panel.Children.Add(search);
         panel.Children.Add(scroll);
 
         RefreshHierarchy();
@@ -361,82 +893,101 @@ public class WorkView : UserControl
         foreach (var entity in _scene.AllEntities)
         {
             if (entity.Parent != null) continue;
+            if (_hierarchySearch.Length > 0 &&
+                !entity.Name.Contains(_hierarchySearch, StringComparison.OrdinalIgnoreCase))
+                continue;
             _hierarchyList.Children.Add(HierItem(entity, 0));
             foreach (var child in entity.Children)
                 _hierarchyList.Children.Add(HierItem(child, 1));
         }
     }
 
+    private static string EntityIcon(Entity e) => e switch
+    {
+        { Camera: not null } => Icons.Camera,
+        { Light: not null } => Icons.Bulb,
+        { MeshRenderer: not null } => Icons.Cube,
+        _ => Icons.Box,
+    };
+
     private Border HierItem(Entity entity, int indent)
     {
         bool sel = _selectedEntity?.Id == entity.Id;
-        string icon = entity switch
+        var name = UiTheme.Txt(entity.Name, 12, sel ? Colors.White : UiTheme.Text, sel ? FontWeight.SemiBold : FontWeight.Normal);
+        name.TextTrimming = TextTrimming.CharacterEllipsis;
+
+        var row = new StackPanel
         {
-            { Camera: not null } => "\U0001f4f7",
-            { Light: not null } => "\u2600",
-            { MeshRenderer: not null } => "\u25b2",
-            _ => "\u25cb"
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            Margin = new Thickness(8 + indent * 14, 0, 8, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+            Children =
+            {
+                UiTheme.Ico(Icons.ChevronDown, 11, UiTheme.Faint),
+                UiTheme.Ico(EntityIcon(entity), 14, sel ? UiTheme.Cyan : UiTheme.Dim),
+                name,
+            },
         };
 
-        var label = new TextBlock
+        var eye = UiTheme.IconBtn(Icons.Eye, () =>
         {
-            Text = $"{icon}  {entity.Name}",
-            Foreground = new SolidColorBrush(sel ? UE_TextBright : UE_TextNormal),
-            FontSize = 12,
-            VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(4 + indent * 16, 0),
-        };
+            if (entity.MeshRenderer != null)
+            {
+                entity.MeshRenderer.IsVisible = !entity.MeshRenderer.IsVisible;
+                Log($"{entity.Name}: {(entity.MeshRenderer.IsVisible ? "visible" : "hidden")}");
+            }
+        }, 14);
+        DockPanel.SetDock(eye, Dock.Right);
+
+        var wrap = new DockPanel { Children = { eye, row } };
 
         var bg = new Border
         {
-            Background = new SolidColorBrush(sel ? UE_Selection : Colors.Transparent),
-            Child = label,
-            Padding = new Thickness(4, 3),
+            Background = sel ? UiTheme.B(Color.Parse("#1c2a6b")) : UiTheme.B(Colors.Transparent),
+            Child = wrap,
+            Padding = new Thickness(3, 6),
+            Margin = new Thickness(5, 0),
+            CornerRadius = new CornerRadius(6),
             Cursor = new Cursor(StandardCursorType.Hand),
         };
-
-        bg.PointerEntered += (_, _) => { if (!sel) bg.Background = new SolidColorBrush(UE_Hover); };
-        bg.PointerExited += (_, _) => { if (!sel) bg.Background = new SolidColorBrush(Colors.Transparent); };
+        if (!sel)
+        {
+            bg.PointerEntered += (_, _) => bg.Background = UiTheme.B(Color.Parse("#151d38"));
+            bg.PointerExited += (_, _) => bg.Background = UiTheme.B(Colors.Transparent);
+        }
         bg.PointerPressed += (_, _) =>
         {
             _selectedEntity = entity;
             RefreshHierarchy();
             RefreshInspector();
-            _statusText.Text = $"Selected: {entity.Name}";
         };
-
         return bg;
     }
 
-    private Panel BuildViewport()
-    {
-        _glViewport = new GlViewport();
-
-        var hint = new TextBlock
-        {
-            Text = "LMB: Orbit | MMB: Pan | Scroll: Zoom",
-            FontSize = 10,
-            Foreground = new SolidColorBrush(UE_TextDim),
-            HorizontalAlignment = HorizontalAlignment.Center,
-            VerticalAlignment = VerticalAlignment.Bottom,
-            Margin = new Thickness(0, 0, 0, 6),
-            IsHitTestVisible = false,
-        };
-
-        var panel = new Panel { Background = new SolidColorBrush(UE_Dark) };
-        panel.Children.Add(_glViewport);
-        panel.Children.Add(hint);
-        return panel;
-    }
-
-    private DockPanel BuildInspectorPanel()
+    // ---------- Inspector ----------
+    private Control BuildInspectorPanel()
     {
         _inspectorContent = new StackPanel { Spacing = 0 };
-        var scroll = new ScrollViewer { Content = _inspectorContent };
+        var scroll = new ScrollViewer { Content = _inspectorContent, Background = UiTheme.B(UiTheme.Panel) };
 
-        var header = PanelHeader("DETAILS");
+        var header = new Border
+        {
+            Height = 34,
+            Background = UiTheme.B(UiTheme.Panel),
+            BorderBrush = UiTheme.B(UiTheme.Border),
+            BorderThickness = new Thickness(0, 0, 0, 1),
+            Padding = new Thickness(12, 0),
+            Child = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                VerticalAlignment = VerticalAlignment.Center,
+                Children = { UiTheme.Ico(Icons.Gear, 15, UiTheme.Cyan), UiTheme.Txt("Inspector", 13, UiTheme.Text, FontWeight.SemiBold) },
+            }
+        };
 
-        var panel = new DockPanel { Background = new SolidColorBrush(UE_Panel) };
+        var panel = new DockPanel { Background = UiTheme.B(UiTheme.Panel) };
         DockPanel.SetDock(header, Dock.Top);
         panel.Children.Add(header);
         panel.Children.Add(scroll);
@@ -450,269 +1001,733 @@ public class WorkView : UserControl
         _inspectorContent.Children.Clear();
         if (_selectedEntity == null)
         {
-            _inspectorContent.Children.Add(new TextBlock
+            _inspectorContent.Children.Add(new StackPanel
             {
-                Text = "No actor selected.\n\nSelect an actor in the World Outliner.",
-                Foreground = new SolidColorBrush(UE_TextDim),
-                FontSize = 11,
-                TextAlignment = TextAlignment.Center,
-                Margin = new Thickness(16, 32),
+                Spacing = 8,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(16, 40),
+                Children =
+                {
+                    UiTheme.Ico(Icons.Box, 34, UiTheme.Faint),
+                    UiTheme.TxtAt("No actor selected", 13, UiTheme.Dim, FontWeight.Medium, HorizontalAlignment.Center),
+                    UiTheme.TxtAt("Select an actor in the Hierarchy.", 11, UiTheme.Faint, FontWeight.Normal, HorizontalAlignment.Center),
+                }
             });
             return;
         }
 
         var e = _selectedEntity;
 
+        // name card
         _inspectorContent.Children.Add(new Border
         {
-            Background = new SolidColorBrush(UE_PanelHeader),
-            Padding = new Thickness(10, 6),
-            Margin = new Thickness(0, 0, 0, 1),
+            Background = UiTheme.B(Color.Parse("#161d33")),
+            Padding = new Thickness(14, 12),
+            Margin = new Thickness(10, 10, 10, 8),
+            CornerRadius = new CornerRadius(9),
+            Child = new StackPanel
+            {
+                Spacing = 8,
+                Children =
+                {
+                    new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Spacing = 10,
+                        Children =
+                        {
+                            UiTheme.Ico(EntityIcon(e), 20, UiTheme.Cyan),
+                            UiTheme.Txt(e.Name, 15, UiTheme.Text, FontWeight.Bold),
+                        }
+                    },
+                    new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Spacing = 8,
+                        Children =
+                        {
+                            MiniChip("Tag", "Player"),
+                            MiniChip("Layer", "Default"),
+                        }
+                    },
+                }
+            }
+        });
+
+        // Transform
+        var t = InsSection("Transform");
+        var eul = e.Transform.GetEulerAngles();
+        Vec3Row(t, "Position", e.Transform.Position.X, e.Transform.Position.Y, e.Transform.Position.Z);
+        Vec3Row(t, "Rotation", eul.X, eul.Y, eul.Z);
+        Vec3Row(t, "Scale", e.Transform.Scale.X, e.Transform.Scale.Y, e.Transform.Scale.Z);
+        _inspectorContent.Children.Add(t);
+
+        if (e.MeshRenderer != null)
+        {
+            var s = InsSection("Static Mesh");
+            InsRow(s, "Mesh", e.MeshRenderer.MeshName ?? "None");
+            InsRow(s, "Visible", e.MeshRenderer.IsVisible ? "Yes" : "No");
+            _inspectorContent.Children.Add(s);
+        }
+        if (e.Light != null)
+        {
+            var s = InsSection("Light");
+            InsRow(s, "Type", e.Light.LightType.ToString());
+            InsRow(s, "Intensity", e.Light.Intensity.ToString("F2"));
+            _inspectorContent.Children.Add(s);
+        }
+        if (e.Camera != null)
+        {
+            var s = InsSection("Camera");
+            InsRow(s, "Primary", e.Camera.IsPrimary ? "Yes" : "No");
+            InsRow(s, "FOV", e.Camera.FieldOfView + "\u00b0");
+            InsRow(s, "Clip", $"{e.Camera.NearPlane} — {e.Camera.FarPlane}");
+            _inspectorContent.Children.Add(s);
+        }
+
+        // actions
+        var actions = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            Margin = new Thickness(12, 14, 12, 20),
+            Children =
+            {
+                ActionSmall("+ Add Component", ShowAddComponentMenu, true),
+                ActionSmall("Duplicate", DuplicateSelected),
+                ActionSmall("Delete", DeleteSelected),
+            }
+        };
+        _inspectorContent.Children.Add(actions);
+    }
+
+    private static Border MiniChip(string label, string value)
+        => new()
+        {
+            Background = UiTheme.B(UiTheme.Card),
+            BorderBrush = UiTheme.B(UiTheme.Border),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(9, 4),
+            Child = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 7,
+                Children = { UiTheme.Txt(label, 10, UiTheme.Faint), UiTheme.Txt(value, 11, UiTheme.Text) },
+            },
+        };
+
+    private static StackPanel InsSection(string title)
+    {
+        var body = new StackPanel { Background = UiTheme.B(UiTheme.Panel), Margin = new Thickness(0, 0, 0, 6) };
+        body.Children.Add(new Border
+        {
+            Background = UiTheme.B(Color.Parse("#161d33")),
+            CornerRadius = new CornerRadius(6),
+            Margin = new Thickness(6, 0, 6, 6),
+            Padding = new Thickness(9, 7),
             Child = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
                 Spacing = 8,
-                Children =
-                {
-                    new TextBlock { Text = e switch { { Camera: not null } => "\U0001f4f7", { Light: not null } => "\u2600", { MeshRenderer: not null } => "\u25b2", _ => "\u25cb" }, FontSize = 14, VerticalAlignment = VerticalAlignment.Center },
-                    new TextBlock { Text = e.Name, Foreground = new SolidColorBrush(UE_TextBright), FontSize = 13, FontWeight = FontWeight.Bold, VerticalAlignment = VerticalAlignment.Center }
-                }
+                Children = { UiTheme.Ico(Icons.ChevronDown, 12, UiTheme.Dim), UiTheme.Txt(title.ToUpperInvariant(), 11, UiTheme.Dim, FontWeight.SemiBold) },
             }
         });
-
-        var tSection = UESection("TRANSFORM");
-        UEVec3Field(tSection, "Location", e.Transform.Position.X, e.Transform.Position.Y, e.Transform.Position.Z);
-        var euler = e.Transform.GetEulerAngles();
-        UEVec3Field(tSection, "Rotation", euler.X, euler.Y, euler.Z);
-        UEVec3Field(tSection, "Scale", e.Transform.Scale.X, e.Transform.Scale.Y, e.Transform.Scale.Z);
-        _inspectorContent.Children.Add(tSection);
-
-        if (e.Camera != null)
-        {
-            var s = UESection("CAMERA");
-            UECheckboxField(s, "Primary", e.Camera.IsPrimary);
-            UETextField(s, "FOV", $"{e.Camera.FieldOfView}\u00b0");
-            UETextField(s, "Near Clip", e.Camera.NearPlane.ToString());
-            UETextField(s, "Far Clip", e.Camera.FarPlane.ToString());
-            _inspectorContent.Children.Add(s);
-        }
-
-        if (e.MeshRenderer != null)
-        {
-            var s = UESection("STATIC MESH");
-            UETextField(s, "Mesh", e.MeshRenderer.MeshName ?? "None");
-            UECheckboxField(s, "Visible", e.MeshRenderer.IsVisible);
-            _inspectorContent.Children.Add(s);
-        }
-
-        if (e.Light != null)
-        {
-            var s = UESection("LIGHT");
-            UETextField(s, "Type", e.Light.LightType.ToString());
-            UETextField(s, "Intensity", e.Light.Intensity.ToString("F2"));
-            _inspectorContent.Children.Add(s);
-        }
-
-        _inspectorContent.Children.Add(new Border
-        {
-            Margin = new Thickness(6, 8),
-            Child = UEActionButton("+ Add Component", () => Log("Add component")),
-        });
+        return body;
     }
 
-    private DockPanel BuildBottomPanel()
+    private static void InsRow(StackPanel section, string label, string value)
     {
-        _consoleLog = new TextBlock
+        section.Children.Add(new DockPanel
         {
-            Text = "",
-            Foreground = new SolidColorBrush(UE_Green),
-            FontFamily = new FontFamily("Cascadia Code, Consolas, Courier New"),
-            FontSize = 11,
-            TextWrapping = TextWrapping.Wrap,
-            Margin = new Thickness(6, 4),
-        };
-
-        var scroll = new ScrollViewer { Content = _consoleLog, Background = new SolidColorBrush(UE_Dark) };
-
-        var clearBtn = UEActionButton("Clear", () => { _logMessages.Clear(); _consoleLog.Text = ""; });
-        clearBtn.Margin = new Thickness(4, 0);
-
-        var tab1 = UETabButton("Output Log", true);
-        var tab2 = UETabButton("Build", false);
-        var tabs = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 0 };
-        tabs.Children.Add(tab1);
-        tabs.Children.Add(tab2);
-
-        var headerBar = new DockPanel { Background = new SolidColorBrush(UE_PanelHeader), Height = 26 };
-        DockPanel.SetDock(tabs, Dock.Left);
-        DockPanel.SetDock(clearBtn, Dock.Right);
-        headerBar.Children.Add(clearBtn);
-        headerBar.Children.Add(tabs);
-
-        var panel = new DockPanel { Background = new SolidColorBrush(UE_Panel), Height = 160 };
-        DockPanel.SetDock(headerBar, Dock.Top);
-        panel.Children.Add(headerBar);
-        panel.Children.Add(scroll);
-
-        return panel;
-    }
-
-    private DockPanel BuildStatusBar()
-    {
-        _fpsText = new TextBlock { Text = "FPS: 0", Foreground = new SolidColorBrush(UE_TextDim), FontSize = 10, VerticalAlignment = VerticalAlignment.Center };
-        _entityCountText = new TextBlock { Text = $"Objects: {_scene.AllEntities.Count}", Foreground = new SolidColorBrush(UE_TextDim), FontSize = 10, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(16, 0, 0, 0) };
-        _statusText = new TextBlock { Text = "Ready", Foreground = new SolidColorBrush(UE_TextDim), FontSize = 10, VerticalAlignment = VerticalAlignment.Center };
-
-        var right = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
-        right.Children.Add(_statusText);
-
-        var left = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
-        left.Children.Add(_fpsText);
-        left.Children.Add(_entityCountText);
-        DockPanel.SetDock(left, Dock.Right);
-
-        var bar = new DockPanel { Background = new SolidColorBrush(UE_Panel), Height = 22 };
-        bar.Children.Add(left);
-        bar.Children.Add(right);
-        return bar;
-    }
-
-    private static Border PanelHeader(string title)
-    {
-        return new Border
-        {
-            Background = new SolidColorBrush(UE_PanelHeader),
-            Height = 24,
-            ClipToBounds = true,
-            Child = new TextBlock
+            Margin = new Thickness(12, 3),
+            Children =
             {
-                Text = $"  {title}",
-                Foreground = new SolidColorBrush(UE_TextDim),
-                FontSize = 10,
-                FontWeight = FontWeight.SemiBold,
-                FontFamily = new FontFamily("Segoe UI, Arial"),
-                VerticalAlignment = VerticalAlignment.Center,
-                LetterSpacing = 1.0,
+                UiTheme.TxtAt(value, 11, UiTheme.Text, FontWeight.Medium, HorizontalAlignment.Right),
+                UiTheme.Txt(label, 11, UiTheme.Dim),
             }
-        };
-    }
-
-    private static StackPanel UESection(string title)
-    {
-        var content = new StackPanel
-        {
-            Background = new SolidColorBrush(UE_Panel),
-            Margin = new Thickness(0, 0, 0, 1),
-        };
-        content.Children.Add(new Border
-        {
-            Background = new SolidColorBrush(UE_PanelHeader),
-            Padding = new Thickness(8, 4),
-            Child = new TextBlock { Text = $"  \u25bc {title}", Foreground = new SolidColorBrush(UE_TextDim), FontSize = 10, FontWeight = FontWeight.SemiBold, FontFamily = new FontFamily("Segoe UI, Arial") }
         });
-        return content;
     }
 
-    private static void UEVec3Field(StackPanel section, string label, float x, float y, float z)
+    private static void Vec3Row(StackPanel section, string label, float x, float y, float z)
     {
-        section.Children.Add(new TextBlock { Text = $"  {label}", Foreground = new SolidColorBrush(UE_TextDim), FontSize = 10, Margin = new Thickness(8, 6, 0, 2) });
+        section.Children.Add(UiTheme.TxtAt(label, 11, UiTheme.Dim, FontWeight.Normal, HorizontalAlignment.Left, new Thickness(12, 6, 0, 3)));
         var grid = new Grid
         {
             ColumnDefinitions = { new ColumnDefinition(new GridLength(1, GridUnitType.Star)), new ColumnDefinition(new GridLength(1, GridUnitType.Star)), new ColumnDefinition(new GridLength(1, GridUnitType.Star)) },
-            Margin = new Thickness(8, 0, 8, 4),
+            Margin = new Thickness(12, 0, 12, 4),
         };
-        grid.Children.Add(UENumberBox("X", x, new SolidColorBrush(Color.Parse("#cc5555")))); Grid.SetColumn(grid.Children[0], 0);
-        grid.Children.Add(UENumberBox("Y", y, new SolidColorBrush(Color.Parse("#55aa55")))); Grid.SetColumn(grid.Children[1], 1);
-        grid.Children.Add(UENumberBox("Z", z, new SolidColorBrush(Color.Parse("#5588dd")))); Grid.SetColumn(grid.Children[2], 2);
+        void Add(int col, string axis, float val, Color c)
+        {
+            var cell = new Border
+            {
+                Background = UiTheme.B(UiTheme.Bg),
+                BorderBrush = UiTheme.B(UiTheme.Border),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(5),
+                Padding = new Thickness(7, 4),
+                Margin = new Thickness(0, 0, 5, 0),
+                Child = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Spacing = 7,
+                    Children = { UiTheme.Txt(axis, 10, c, FontWeight.Bold), UiTheme.Txt(val.ToString("F2"), 11, UiTheme.Text) },
+                },
+            };
+            Grid.SetColumn(cell, col);
+            grid.Children.Add(cell);
+        }
+        Add(0, "X", x, Color.Parse("#e06666"));
+        Add(1, "Y", y, Color.Parse("#66c266"));
+        Add(2, "Z", z, Color.Parse("#6699e6"));
         section.Children.Add(grid);
     }
 
-    private static Border UENumberBox(string axis, float value, Brush axisColor)
+    private static Button ActionSmall(string label, Action act, bool primary = false)
     {
-        return new Border
+        var b = new Button
         {
-            Background = new SolidColorBrush(UE_Dark),
-            BorderBrush = new SolidColorBrush(UE_Border),
+            Content = UiTheme.Txt(label, 11, primary ? Colors.White : UiTheme.Text, FontWeight.Medium),
+            Background = UiTheme.B(primary ? UiTheme.Accent : UiTheme.Card),
+            Foreground = UiTheme.B(primary ? Colors.White : UiTheme.Text),
+            BorderBrush = UiTheme.B(primary ? UiTheme.Accent : UiTheme.Border),
             BorderThickness = new Thickness(1),
-            Padding = new Thickness(2, 1),
+            CornerRadius = new CornerRadius(7),
+            Padding = new Thickness(12, 7),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            Cursor = new Cursor(StandardCursorType.Hand),
+        };
+        b.Click += (_, _) => act();
+        return b;
+    }
+
+    // ---------- Bottom panel ----------
+    private Control BuildBottomPanel()
+    {
+        _bottomTabsPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
+        RebuildBottomTabs();
+
+        var clear = UiTheme.ActionButton("Clear", null, () => { _logMessages.Clear(); _consoleLog.Text = ""; });
+        clear.Padding = new Thickness(11, 4);
+        DockPanel.SetDock(clear, Dock.Right);
+
+        var head = new Border
+        {
+            Background = UiTheme.B(Color.Parse("#161d33")),
+            Height = 32,
+            Padding = new Thickness(8, 0),
+            Child = new DockPanel { Children = { clear, _bottomTabsPanel } },
+        };
+        DockPanel.SetDock(head, Dock.Top);
+
+        _bottomHost = new ContentControl { Content = BuildProjectBrowser() };
+
+        var panel = new DockPanel { Background = UiTheme.B(UiTheme.Panel) };
+        panel.Children.Add(head);
+        panel.Children.Add(_bottomHost);
+        return panel;
+    }
+
+    private Control BottomTab(string name)
+    {
+        bool active = name == _bottomTab;
+        var b = new Button
+        {
+            Content = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 7,
+                Children =
+                {
+                    UiTheme.Ico(name switch { "Project" => Icons.Folder, "Console" => Icons.Terminal, "Scripts" => Icons.Code, "Animation" => Icons.PlayCircle, _ => Icons.Dashboard }, 13, active ? UiTheme.Cyan : UiTheme.Faint),
+                    UiTheme.Txt(name, 11, active ? UiTheme.Text : UiTheme.Faint, active ? FontWeight.SemiBold : FontWeight.Normal),
+                }
+            },
+            Background = UiTheme.B(active ? UiTheme.Panel : Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(12, 5),
+            Cursor = new Cursor(StandardCursorType.Hand),
+        };
+        b.Click += (_, _) => { _bottomTab = name; RebuildBottom(); };
+        return b;
+    }
+
+    private void RebuildBottom()
+    {
+        if (_bottomHost == null) return;
+        _bottomHost.Content = _bottomTab switch
+        {
+            "Console" => BuildConsolePanel(),
+            "Scripts" => BuildScriptsPanel(),
+            "Animation" => BuildAnimationPanel(),
+            "Profiler" => BuildProfilerPanel(),
+            _ => BuildProjectBrowser(),
+        };
+        RebuildBottomTabs();
+    }
+
+    private void RebuildBottomTabs()
+    {
+        if (_bottomTabsPanel == null) return;
+        _bottomTabsPanel.Children.Clear();
+        foreach (var name in new[] { "Project", "Console", "Scripts", "Animation", "Profiler" })
+            _bottomTabsPanel.Children.Add(BottomTab(name));
+    }
+
+    private Control BuildProjectBrowser()
+    {
+        // folder tree
+        var folders = new StackPanel { Spacing = 1 };
+        var root = _project.Path;
+        string[] dirs = Directory.Exists(root)
+            ? Directory.GetDirectories(root).Where(d => !d.EndsWith("bin") && !d.EndsWith("obj")).OrderBy(Path.GetFileName).ToArray()
+            : [];
+        if (dirs.Length == 0 && !string.IsNullOrEmpty(_selectedFolder) == false)
+        {
+            // show project root as single node
+            folders.Children.Add(FolderRow("Assets", root, Path.GetFileName(root) == Path.GetFileName(_selectedFolder)));
+        }
+        foreach (var d in dirs)
+            folders.Children.Add(FolderRow(Path.GetFileName(d), d, _selectedFolder == d));
+
+        var folderScroll = new ScrollViewer { Content = folders, Width = 190, Background = UiTheme.B(UiTheme.Bg) };
+
+        // files grid
+        var current = string.IsNullOrEmpty(_selectedFolder) ? root : _selectedFolder;
+        string[] files = Directory.Exists(current) ? Directory.GetFiles(current).OrderBy(Path.GetFileName).ToArray() : Array.Empty<string>();
+        var grid = new WrapPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(12) };
+        foreach (var f in files)
+            grid.Children.Add(FileCard(f));
+
+        if (!files.Any())
+            grid.Children.Add(UiTheme.Txt("No assets in this folder.", 11, UiTheme.Faint));
+
+        var crumb = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            Margin = new Thickness(14, 10, 0, 4),
+            Children =
+            {
+                UiTheme.Ico(Icons.FolderOutline, 14, UiTheme.Cyan),
+                UiTheme.Txt("Assets", 11, UiTheme.Cyan),
+                UiTheme.Ico(Icons.ChevronRight, 11, UiTheme.Faint),
+                UiTheme.Txt(string.IsNullOrEmpty(_selectedFolder) ? "Root" : Path.GetFileName(_selectedFolder), 11, UiTheme.Text),
+            }
+        };
+
+        var filesPanel = new DockPanel();
+        DockPanel.SetDock(crumb, Dock.Top);
+        filesPanel.Children.Add(crumb);
+        filesPanel.Children.Add(new ScrollViewer { Content = grid, Background = UiTheme.B(UiTheme.Bg) });
+
+        var split = new Grid { ColumnDefinitions = { new ColumnDefinition(new GridLength(190)), new ColumnDefinition(new GridLength(1, GridUnitType.Star)) } };
+        Grid.SetColumn(folderScroll, 0);
+        Grid.SetColumn(filesPanel, 1);
+        split.Children.Add(folderScroll);
+        split.Children.Add(filesPanel);
+        var splitLine = new Border { Background = UiTheme.B(UiTheme.Border), Width = 1, HorizontalAlignment = HorizontalAlignment.Left };
+        Grid.SetColumn(splitLine, 1);
+        split.Children.Add(splitLine);
+
+        return split;
+    }
+
+    private Control FolderRow(string name, string path, bool selected)
+    {
+        var row = new Border
+        {
+            Background = selected ? UiTheme.B(Color.Parse("#1c2a6b")) : UiTheme.B(Colors.Transparent),
+            Padding = new Thickness(12, 7),
+            Margin = new Thickness(5, 0),
+            CornerRadius = new CornerRadius(6),
+            Cursor = new Cursor(StandardCursorType.Hand),
             Child = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                Children = { UiTheme.Ico(Icons.FolderOutline, 14, selected ? UiTheme.Cyan : UiTheme.Dim), UiTheme.Txt(name, 11, selected ? UiTheme.Text : UiTheme.Dim) },
+            },
+        };
+        if (!selected)
+        {
+            row.PointerEntered += (_, _) => row.Background = UiTheme.B(Color.Parse("#151d38"));
+            row.PointerExited += (_, _) => row.Background = UiTheme.B(Colors.Transparent);
+        }
+        row.PointerPressed += (_, _) => { _selectedFolder = path; RebuildBottom(); };
+        return row;
+    }
+
+    private Control FileCard(string path)
+    {
+        var name = Path.GetFileName(path);
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+        Color bg = ext switch
+        {
+            ".cs" => Color.Parse("#6a3fb5"),
+            ".json" => Color.Parse("#2f7fd0"),
+            ".obj" => Color.Parse("#2f8f5f"),
+            ".png" or ".jpg" => Color.Parse("#b57f3f"),
+            _ => Color.Parse("#3a4a70"),
+        };
+
+        var card = new Border
+        {
+            Width = 104,
+            Margin = new Thickness(0, 0, 10, 10),
+            CornerRadius = new CornerRadius(8),
+            Background = UiTheme.B(UiTheme.Card),
+            BorderBrush = UiTheme.B(UiTheme.Border),
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(8),
+            Cursor = new Cursor(StandardCursorType.Hand),
+            Child = new StackPanel
+            {
+                Spacing = 7,
                 Children =
                 {
-                    new TextBlock { Text = axis, Foreground = axisColor, FontSize = 10, FontWeight = FontWeight.Bold, VerticalAlignment = VerticalAlignment.Center, Width = 14 },
-                    new TextBlock { Text = value.ToString("F2"), Foreground = new SolidColorBrush(UE_TextNormal), FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(2, 0, 0, 0) }
+                    new Border
+                    {
+                        Height = 54,
+                        CornerRadius = new CornerRadius(6),
+                        Background = UiTheme.B(Color.Parse("#0d1220")),
+                        Child = UiTheme.Ico(ext == ".cs" ? Icons.Code : Icons.File, 22, bg),
+                    },
+                    new TextBlock
+                    {
+                        Text = name,
+                        FontSize = 10,
+                        Foreground = UiTheme.B(UiTheme.Text),
+                        TextTrimming = TextTrimming.CharacterEllipsis,
+                        FontFamily = UiTheme.Body,
+                    },
+                }
+            },
+        };
+        card.PointerPressed += (_, _) =>
+        {
+            if (ext == ".cs") OpenScript(path);
+            else if (ext == ".obj") ImportObjFile(path);
+            else Log($"Opened {name}");
+        };
+        return card;
+    }
+
+    private Control BuildConsolePanel()
+    {
+        return new ScrollViewer { Content = _consoleLog, Background = UiTheme.B(UiTheme.Bg) };
+    }
+
+    // ---------- Scripts panel ----------
+    private string ScriptsDir => Path.Combine(_project.Path, "Scripts");
+
+    private Control BuildScriptsPanel()
+    {
+        Directory.CreateDirectory(ScriptsDir);
+        var files = Directory.GetFiles(ScriptsDir, "*.cs").OrderBy(Path.GetFileName).ToArray();
+
+        // left: script file list
+        var list = new StackPanel { Spacing = 2 };
+        var newBtn = UiTheme.ActionButton("New Script", Icons.Plus, AddScript);
+        newBtn.Padding = new Thickness(10, 5);
+        newBtn.Margin = new Thickness(8, 8, 8, 4);
+        list.Children.Add(newBtn);
+
+        foreach (var f in files)
+        {
+            string path = f;
+            string name = Path.GetFileName(f);
+            bool sel = _currentScriptPath == path;
+            var row = new Border
+            {
+                Background = sel ? UiTheme.B(Color.Parse("#1c2a6b")) : UiTheme.B(Colors.Transparent),
+                Padding = new Thickness(12, 6),
+                Margin = new Thickness(5, 0),
+                CornerRadius = new CornerRadius(6),
+                Cursor = new Cursor(StandardCursorType.Hand),
+                Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { UiTheme.Ico(Icons.Code, 13, UiTheme.Purple), UiTheme.Txt(name, 11, sel ? Colors.White : UiTheme.Text) } },
+            };
+            if (!sel)
+            {
+                row.PointerEntered += (_, _) => row.Background = UiTheme.B(Color.Parse("#151d38"));
+                row.PointerExited += (_, _) => row.Background = UiTheme.B(Colors.Transparent);
+            }
+            row.PointerPressed += (_, _) => OpenScript(path);
+            list.Children.Add(row);
+        }
+
+        var listScroll = new ScrollViewer { Content = list, Width = 190, Background = UiTheme.B(UiTheme.Bg) };
+
+        // right: editor
+        var editor = new TextBox
+        {
+            AcceptsReturn = true,
+            AcceptsTab = true,
+            TextWrapping = TextWrapping.NoWrap,
+            FontFamily = UiTheme.Mono,
+            FontSize = 12,
+            Background = UiTheme.B(UiTheme.Bg),
+            Foreground = UiTheme.B(UiTheme.Text),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(12),
+        };
+        editor.SetValue(ScrollViewer.HorizontalScrollBarVisibilityProperty, Avalonia.Controls.Primitives.ScrollBarVisibility.Auto);
+        editor.SetValue(ScrollViewer.VerticalScrollBarVisibilityProperty, Avalonia.Controls.Primitives.ScrollBarVisibility.Auto);
+
+        string? scriptPath = _currentScriptPath;
+        if (scriptPath != null && File.Exists(scriptPath))
+            editor.Text = File.ReadAllText(scriptPath);
+        else
+            editor.Text = "// Select or create a script.\n// Scripts compile when you press Play.\n";
+        _scriptEditor = editor;
+
+        var toolbar = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Margin = new Thickness(12, 10, 12, 0) };
+        var saveBtn = UiTheme.ActionButton("Save", Icons.Save, () =>
+        {
+            if (_currentScriptPath == null) { Log("No script open."); return; }
+            File.WriteAllText(_currentScriptPath, editor.Text);
+            Log($"Saved {Path.GetFileName(_currentScriptPath)}");
+        });
+        saveBtn.Padding = new Thickness(12, 6);
+        var compileBtn = UiTheme.ActionButton("Compile", Icons.Code, () =>
+        {
+            if (_currentScriptPath != null) File.WriteAllText(_currentScriptPath, editor.Text);
+            CompileScriptsNow();
+        });
+        compileBtn.Padding = new Thickness(12, 6);
+        toolbar.Children.Add(saveBtn);
+        toolbar.Children.Add(compileBtn);
+        if (_currentScriptPath != null)
+            toolbar.Children.Add(UiTheme.Txt(Path.GetFileName(_currentScriptPath), 11, UiTheme.Dim));
+
+        _scriptErrorText = UiTheme.Txt("", 11, UiTheme.Red);
+        _scriptErrorText.Margin = new Thickness(12, 6, 12, 0);
+        _scriptErrorText.TextWrapping = TextWrapping.Wrap;
+        _scriptErrorText.IsVisible = false;
+
+        var right = new StackPanel();
+        right.Children.Add(toolbar);
+        right.Children.Add(_scriptErrorText);
+        right.Children.Add(new Border
+        {
+            Margin = new Thickness(12, 8),
+            Background = UiTheme.B(UiTheme.Bg),
+            BorderBrush = UiTheme.B(UiTheme.Border),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(7),
+            Child = new ScrollViewer { Content = editor, MaxHeight = 130 },
+        });
+
+        var split = new Grid { ColumnDefinitions = { new ColumnDefinition(new GridLength(190)), new ColumnDefinition(new GridLength(1, GridUnitType.Star)) } };
+        Grid.SetColumn(listScroll, 0);
+        Grid.SetColumn(right, 1);
+        split.Children.Add(listScroll);
+        split.Children.Add(right);
+        var line = new Border { Background = UiTheme.B(UiTheme.Border), Width = 1, HorizontalAlignment = HorizontalAlignment.Left };
+        Grid.SetColumn(line, 1);
+        split.Children.Add(line);
+        return split;
+    }
+
+    private void OpenScript(string path)
+    {
+        _currentScriptPath = path;
+        _bottomTab = "Scripts";
+        RebuildBottom();
+    }
+
+    private void AddScript()
+    {
+        Directory.CreateDirectory(ScriptsDir);
+        int n = 1;
+        string path;
+        do { path = Path.Combine(ScriptsDir, $"Script{n}.cs"); n++; } while (File.Exists(path));
+
+        string cls = Path.GetFileNameWithoutExtension(path);
+        File.WriteAllText(path, $$"""
+            using Lumo.Engine.Scripting;
+
+            public class {{cls}} : LumoScript
+            {
+                public override void OnStart()
+                {
+                    Log("{{cls}} started");
+                }
+
+                public override void OnUpdate(float dt)
+                {
+                    // Your game logic here, e.g.:
+                    // Position += new System.Numerics.Vector3(dt, 0, 0);
+                }
+            }
+            """);
+
+        OpenScript(path);
+        Log($"Created {Path.GetFileName(path)}");
+    }
+
+    private void CompileScriptsNow()
+    {
+        Directory.CreateDirectory(ScriptsDir);
+        var sources = Directory.GetFiles(ScriptsDir, "*.cs").Select(File.ReadAllText).ToList();
+        if (sources.Count == 0) { Log("No scripts to compile."); return; }
+
+        if (_scriptHost.Compile(sources))
+        {
+            if (_scriptErrorText != null) { _scriptErrorText.IsVisible = false; _scriptErrorText.Text = ""; }
+            Log($"Compiled {sources.Count} script(s) OK.");
+        }
+        else
+        {
+            var msg = string.Join("\n", _scriptHost.Errors.Take(6));
+            if (_scriptErrorText != null) { _scriptErrorText.Text = msg; _scriptErrorText.IsVisible = true; }
+            foreach (var e in _scriptHost.Errors) Log($"CS: {e}");
+        }
+    }
+
+    private void AttachScriptToSelected(string className)
+    {
+        if (_selectedEntity == null) { Log("Select an entity first."); return; }
+        _selectedEntity.Scripts ??= new Lumo.Engine.Scripting.ScriptComponent();
+        if (!_selectedEntity.Scripts.ScriptNames.Contains(className))
+            _selectedEntity.Scripts.ScriptNames.Add(className);
+        RefreshInspector();
+        Log($"Attached {className} to {_selectedEntity.Name}");
+    }
+
+    // ---------- Animation / Profiler ----------
+    private Control BuildAnimationPanel()
+    {
+        return new ScrollViewer
+        {
+            Background = UiTheme.B(UiTheme.Bg),
+            Content = new StackPanel
+            {
+                Margin = new Thickness(16),
+                Spacing = 8,
+                Children =
+                {
+                    UiTheme.Txt("Animation", 13, UiTheme.Text, FontWeight.SemiBold),
+                    UiTheme.Txt("No animation clips in this project yet.", 11, UiTheme.Faint),
                 }
             }
         };
     }
 
-    private static void UETextField(StackPanel section, string label, string value)
+    private Control BuildProfilerPanel()
     {
-        var row = new Grid
+        _profilerStats = UiTheme.Txt("FPS: 0", 12, UiTheme.Green);
+        return new ScrollViewer
         {
-            ColumnDefinitions = { new ColumnDefinition(new GridLength(90)), new ColumnDefinition(new GridLength(1, GridUnitType.Star)) },
-            Margin = new Thickness(8, 2),
-        };
-        row.Children.Add(new TextBlock { Text = $"  {label}", Foreground = new SolidColorBrush(UE_TextDim), FontSize = 11, VerticalAlignment = VerticalAlignment.Center }); Grid.SetColumn(row.Children[0], 0);
-        row.Children.Add(new TextBlock { Text = value, Foreground = new SolidColorBrush(UE_TextBright), FontSize = 11, VerticalAlignment = VerticalAlignment.Center }); Grid.SetColumn(row.Children[1], 1);
-        section.Children.Add(row);
-    }
-
-    private static void UECheckboxField(StackPanel section, string label, bool value)
-    {
-        var row = new Grid
-        {
-            ColumnDefinitions = { new ColumnDefinition(new GridLength(90)), new ColumnDefinition(new GridLength(1, GridUnitType.Star)) },
-            Margin = new Thickness(8, 2),
-        };
-        row.Children.Add(new TextBlock { Text = $"  {label}", Foreground = new SolidColorBrush(UE_TextDim), FontSize = 11, VerticalAlignment = VerticalAlignment.Center }); Grid.SetColumn(row.Children[0], 0);
-        row.Children.Add(new TextBlock { Text = value ? "\u2611" : "\u2610", Foreground = new SolidColorBrush(value ? UE_AccentBlue : UE_TextDim), FontSize = 13, VerticalAlignment = VerticalAlignment.Center }); Grid.SetColumn(row.Children[1], 1);
-        section.Children.Add(row);
-    }
-
-    private static Button UEActionButton(string label, Action onClick)
-    {
-        var btn = new Button
-        {
-            Content = label,
-            Padding = new Thickness(12, 4),
-            FontSize = 11,
-            Background = new SolidColorBrush(UE_Dark),
-            Foreground = new SolidColorBrush(UE_TextNormal),
-            BorderBrush = new SolidColorBrush(UE_Border),
-            BorderThickness = new Thickness(1),
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-            Cursor = new Cursor(StandardCursorType.Hand),
-        };
-        btn.PointerEntered += (_, _) => { btn.Background = new SolidColorBrush(UE_Hover); btn.BorderBrush = new SolidColorBrush(UE_TextDim); };
-        btn.PointerExited += (_, _) => { btn.Background = new SolidColorBrush(UE_Dark); btn.BorderBrush = new SolidColorBrush(UE_Border); };
-        btn.Click += (_, _) => onClick();
-        return btn;
-    }
-
-    private static Button UETabButton(string label, bool active)
-    {
-        return new Button
-        {
-            Content = label,
-            Padding = new Thickness(10, 0),
-            Height = 24,
-            FontSize = 10,
-            Background = active ? new SolidColorBrush(UE_Dark) : new SolidColorBrush(Colors.Transparent),
-            Foreground = active ? new SolidColorBrush(UE_TextBright) : new SolidColorBrush(UE_TextDim),
-            BorderThickness = new Thickness(0),
-            Cursor = new Cursor(StandardCursorType.Hand),
+            Background = UiTheme.B(UiTheme.Bg),
+            Content = new StackPanel
+            {
+                Margin = new Thickness(16),
+                Spacing = 8,
+                Children =
+                {
+                    UiTheme.Txt("Profiler", 13, UiTheme.Text, FontWeight.SemiBold),
+                    _profilerStats,
+                }
+            }
         };
     }
 
+    // ---------- Actions ----------
+    private void NewScene()
+    {
+        if (_isPlaying) { Log("Stop play mode first."); return; }
+        _scene = new SceneType { Name = _project.Name };
+        _selectedEntity = null;
+        RefreshHierarchy();
+        RefreshInspector();
+        SaveProject();
+        Log("New scene created.");
+    }
+
+    private void BuildProject()
+    {
+        Log($"Building {_project.Name} (Windows x64)...");
+        try
+        {
+            Directory.CreateDirectory(ScriptsDir);
+            var sources = Directory.GetFiles(ScriptsDir, "*.cs").Select(File.ReadAllText).ToList();
+            if (sources.Count > 0 && !_scriptHost.Compile(sources))
+            {
+                Log($"Build failed: {_scriptHost.Errors.Count} script error(s).");
+                foreach (var e in _scriptHost.Errors.Take(3)) Log($"CS: {e}");
+                return;
+            }
+            SaveProject();
+            Log($"Build succeeded: {sources.Count} script(s), {_scene.AllEntities.Count} entity(ies).");
+        }
+        catch (Exception ex) { Log($"Build failed: {ex.Message}"); }
+    }
+
+    private void OpenSettings()
+    {
+        Log($"Settings — {EngineConstants.Name} v{EngineConstants.Version} | Renderer: {(_glViewport != null && _glViewport.IsReady ? "OpenGL" : "Software")} | Project: {_project.Path}");
+    }
+
+    private void CompileScriptsSafe()
+    {
+        try { CompileScriptsNow(); }
+        catch (Exception ex) { Log($"Compile error: {ex.Message}"); }
+    }
+
+    // ---------- Status bar ----------
+    private Control BuildStatusBar()
+    {
+        _fpsText = UiTheme.Txt("FPS: 0", 11, UiTheme.Dim);
+        _entityCountText = UiTheme.Txt($"{_scene.AllEntities.Count} objects", 11, UiTheme.Dim);
+        _statusText = UiTheme.Txt("Ready", 11, UiTheme.Dim);
+
+        var left = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(14, 0),
+            Children = { UiTheme.Txt("Lumo Game Engine", 11, UiTheme.Faint), UiTheme.Txt("•", 11, UiTheme.Faint), UiTheme.Txt("Build the next generation", 11, UiTheme.Faint) },
+        };
+
+        var right = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 14,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 14, 0),
+            Children =
+            {
+                _statusText,
+                _fpsText,
+                _entityCountText,
+                new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Spacing = 6,
+                    Children =
+                    {
+                        new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4), Background = UiTheme.B(UiTheme.Green) },
+                        UiTheme.Txt("Engine Ready", 11, UiTheme.Green, FontWeight.SemiBold),
+                    }
+                },
+            }
+        };
+        DockPanel.SetDock(right, Dock.Right);
+
+        var bar = new DockPanel { Height = 30, Background = UiTheme.B(UiTheme.Sidebar), Children = { right, left } };
+        return new Border { BorderBrush = UiTheme.B(UiTheme.Border), BorderThickness = new Thickness(0, 1, 0, 0), Child = bar };
+    }
+
+    // ---------- Actions ----------
     private void CreateEntity(string name)
     {
         var entity = _scene.CreateEntity(name);
         _selectedEntity = entity;
         RefreshHierarchy();
         RefreshInspector();
-        _statusText.Text = $"Created: {name}";
         Log($"Created: {name}");
     }
 
@@ -748,16 +1763,6 @@ public class WorkView : UserControl
         Log("Created Directional Light.");
     }
 
-    private void CreatePointLight()
-    {
-        var e = _scene.CreateEntity("Point Light");
-        e.Light = new LightComponent { LightType = LightType.Point, Intensity = 1.0f };
-        _selectedEntity = e;
-        RefreshHierarchy();
-        RefreshInspector();
-        Log("Created Point Light.");
-    }
-
     private void DuplicateSelected()
     {
         if (_selectedEntity == null) { Log("Nothing to duplicate."); return; }
@@ -784,17 +1789,16 @@ public class WorkView : UserControl
     {
         string ts = DateTime.Now.ToString("HH:mm:ss");
         _logMessages.Add($"[{ts}] {message}");
-        _consoleLog.Text = string.Join("\n", _logMessages);
-        _statusText.Text = message;
+        if (_consoleLog != null) _consoleLog.Text = string.Join("\n", _logMessages);
+        if (_statusText != null) _statusText.Text = message;
     }
 
     private void ExportSceneAsObj()
     {
         try
         {
-var sb = new StringBuilder();
-        int vertexOffset = 0;
-
+            var sb = new StringBuilder();
+            int vertexOffset = 0;
             sb.AppendLine("# Lumo Engine OBJ Export");
             sb.AppendLine($"# Objects: {_scene.AllEntities.Count}");
             sb.AppendLine();
@@ -802,66 +1806,164 @@ var sb = new StringBuilder();
             foreach (var entity in _scene.AllEntities)
             {
                 if (entity.MeshRenderer == null || entity.Transform == null) continue;
-                var meshName = entity.MeshRenderer.MeshName ?? "Cube";
                 var pos = entity.Transform.Position;
-                var rot = entity.Transform.GetEulerAngles();
                 var scale = entity.Transform.Scale;
-
-                float radY = MathHelper.DegreesToRadians(rot.Y);
-                float radX = MathHelper.DegreesToRadians(rot.X);
-                float radZ = MathHelper.DegreesToRadians(rot.Z);
-
-                float cx = pos.X, cy = pos.Y, cz = pos.Z;
                 float s = scale.X;
 
-                float[,] cubeVerts = new float[,] {
+                float[,] cubeVerts = {
                     {-0.5f,-0.5f,-0.5f}, {0.5f,-0.5f,-0.5f}, {0.5f,0.5f,-0.5f}, {-0.5f,0.5f,-0.5f},
                     {-0.5f,-0.5f,0.5f}, {0.5f,-0.5f,0.5f}, {0.5f,0.5f,0.5f}, {-0.5f,0.5f,0.5f}
                 };
-                int[,] cubeFaces = new int[,] {
-                    {0,1,2,3}, {5,4,7,6}, {4,0,3,7}, {1,5,6,2}, {3,2,6,7}, {4,5,1,0}
-                };
-
                 sb.AppendLine($"o {entity.Name}");
                 for (int i = 0; i < 8; i++)
-                {
-                    float x = cubeVerts[i,0]*s, y = cubeVerts[i,1]*s, z = cubeVerts[i,2]*s;
-                    float rx = x*MathF.Cos(radY) - z*MathF.Sin(radY);
-                    float rz = x*MathF.Sin(radY) + z*MathF.Cos(radY);
-                    float ry = y*MathF.Cos(radX) - rz*MathF.Sin(radX);
-                    float rz2 = y*MathF.Sin(radX) + rz*MathF.Cos(radX);
-                    sb.AppendLine($"v {rx+cx} {ry+cy} {rz2+cz}");
-                }
+                    sb.AppendLine($"v {cubeVerts[i,0]*s+pos.X} {cubeVerts[i,1]*s+pos.Y} {cubeVerts[i,2]*s+pos.Z}");
+                sb.AppendLine("usemtl Cube");
                 for (int i = 0; i < 6; i++)
                 {
-                    sb.AppendLine($"vn 0 0 1");
-                    sb.AppendLine($"vn 0 0 -1");
-                    sb.AppendLine($"vn 0 1 0");
-                    sb.AppendLine($"vn 0 -1 0");
-                    sb.AppendLine($"vn 1 0 0");
-                    sb.AppendLine($"vn -1 0 0");
-                }
-                sb.AppendLine($"usemtl {meshName}");
-                for (int i = 0; i < 6; i++)
-                {
-                    int baseV = vertexOffset + i*4 + 1;
-                    sb.AppendLine($"f {baseV}/{baseV} {baseV+1}/{baseV+1} {baseV+2}/{baseV+2} {baseV+3}/{baseV+3}");
+                    int b = vertexOffset + i * 4 + 1;
+                    sb.AppendLine($"f {b} {b+1} {b+2} {b+3}");
                 }
                 vertexOffset += 8;
             }
 
             var savePath = Path.Combine(_project.Path, "Scenes", "scene.obj");
+            Directory.CreateDirectory(Path.GetDirectoryName(savePath)!);
             File.WriteAllText(savePath, sb.ToString());
             Log($"Exported scene to {savePath}");
         }
-        catch (Exception ex)
-        {
-            Log($"Export failed: {ex.Message}");
-        }
+        catch (Exception ex) { Log($"Export failed: {ex.Message}"); }
     }
 
-    private void ImportObj()
+    private async System.Threading.Tasks.Task ImportAssetAsync()
     {
-        Log("OBJ import triggered.");
+        try
+        {
+            var topLevel = TopLevel.GetTopLevel(this);
+            if (topLevel == null) { Log("No top level for file dialog."); return; }
+
+            var files = await topLevel.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+            {
+                Title = "Import Asset",
+                AllowMultiple = false,
+                FileTypeFilter =
+                [
+                    new FilePickerFileType("3D Models") { Patterns = ["*.obj"] },
+                    new FilePickerFileType("All Files") { Patterns = ["*.*"] },
+                ],
+            });
+
+            if (files.Count == 0) { Log("Import cancelled."); return; }
+            var path = files[0].TryGetLocalPath();
+            if (path == null) { Log("Could not resolve file path."); return; }
+
+            if (Path.GetExtension(path).ToLowerInvariant() != ".obj")
+            {
+                Log($"Unsupported format: {Path.GetExtension(path)} (OBJ supported).");
+                return;
+            }
+
+            ImportObjFile(path);
+        }
+        catch (Exception ex) { Log($"Import failed: {ex.Message}"); }
+    }
+
+    private void ImportObjFile(string path)
+    {
+        try
+        {
+            var mesh = ObjImporter.Load(path);
+            MeshLibrary.Register(mesh);
+
+            var entity = _scene.CreateEntity(mesh.Name);
+            entity.MeshRenderer = new MeshRendererComponent { MeshName = mesh.Name };
+
+            _selectedEntity = entity;
+            RefreshHierarchy();
+            RefreshInspector();
+            SaveProject();
+            Log($"Imported {mesh.Name}: {mesh.VertexCount} verts, {mesh.TriangleCount} tris.");
+        }
+        catch (Exception ex) { Log($"OBJ import failed: {ex.Message}"); }
+    }
+
+    // ---------- Keyboard (play mode) ----------
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (!_isPlaying || _playInput == null) return;
+        var key = MapKey(e.Key);
+        if (key != LumoKey.Unknown) { _playInput.KeyPressed(key); e.Handled = true; }
+    }
+
+    protected override void OnKeyUp(KeyEventArgs e)
+    {
+        base.OnKeyUp(e);
+        if (_playInput == null) return;
+        var key = MapKey(e.Key);
+        if (key != LumoKey.Unknown) { _playInput.KeyReleased(key); e.Handled = true; }
+    }
+
+    private static LumoKey MapKey(Key key) => key switch
+    {
+        Key.W => LumoKey.W, Key.A => LumoKey.A, Key.S => LumoKey.S, Key.D => LumoKey.D,
+        Key.Q => LumoKey.Q, Key.E => LumoKey.E, Key.R => LumoKey.R, Key.F => LumoKey.F,
+        Key.Z => LumoKey.Z, Key.X => LumoKey.X, Key.C => LumoKey.C, Key.V => LumoKey.V,
+        Key.B => LumoKey.B, Key.N => LumoKey.N, Key.M => LumoKey.M, Key.P => LumoKey.P,
+        Key.G => LumoKey.G, Key.H => LumoKey.H, Key.J => LumoKey.J, Key.K => LumoKey.K,
+        Key.L => LumoKey.L, Key.Y => LumoKey.Y, Key.T => LumoKey.T, Key.U => LumoKey.U,
+        Key.I => LumoKey.I, Key.O => LumoKey.O,
+        Key.Space => LumoKey.Space, Key.Escape => LumoKey.Escape, Key.Enter => LumoKey.Enter,
+        Key.Tab => LumoKey.Tab, Key.Back => LumoKey.Backspace,
+        Key.Left => LumoKey.Left, Key.Right => LumoKey.Right, Key.Up => LumoKey.Up, Key.Down => LumoKey.Down,
+        Key.LeftShift => LumoKey.LeftShift, Key.LeftCtrl => LumoKey.LeftControl, Key.LeftAlt => LumoKey.LeftAlt,
+        _ => LumoKey.Unknown,
+    };
+
+    // ---------- Add component ----------
+    private void ShowAddComponentMenu()
+    {
+        if (_selectedEntity == null) { Log("Select an entity first."); return; }
+
+        var menu = new MenuFlyout { Placement = PlacementMode.Bottom };
+        void Item(string label, Action act)
+        {
+            var mi = new MenuItem { Header = label };
+            mi.Click += (_, _) => act();
+            menu.Items.Add(mi);
+        }
+
+        var e = _selectedEntity;
+        if (e.MeshRenderer == null) Item("Static Mesh", () => { e.MeshRenderer = new MeshRendererComponent { MeshName = "Cube" }; RefreshInspector(); RefreshHierarchy(); Log("Added Static Mesh (Cube)."); });
+        if (e.Camera == null) Item("Camera", () => { e.Camera = new CameraComponent { IsPrimary = _scene.AllEntities.All(x => x.Camera == null) }; RefreshInspector(); RefreshHierarchy(); Log("Added Camera."); });
+        if (e.Light == null) Item("Light (Directional)", () => { e.Light = new LightComponent { LightType = LightType.Directional }; RefreshInspector(); RefreshHierarchy(); Log("Added Light."); });
+        if (e.SpriteRenderer == null) Item("Sprite Renderer", () => { e.SpriteRenderer = new SpriteRendererComponent(); RefreshInspector(); RefreshHierarchy(); Log("Added Sprite Renderer."); });
+        Item("Script", ShowAttachScriptMenu);
+
+        menu.ShowAt(this);
+    }
+
+    private void ShowAttachScriptMenu(object? sender, EventArgs e) => ShowAttachScriptMenu();
+
+    private void ShowAttachScriptMenu()
+    {
+        if (_selectedEntity == null) return;
+        Directory.CreateDirectory(ScriptsDir);
+        var files = Directory.GetFiles(ScriptsDir, "*.cs").OrderBy(Path.GetFileName).ToArray();
+
+        var menu = new MenuFlyout { Placement = PlacementMode.Bottom };
+        if (files.Length == 0)
+        {
+            var none = new MenuItem { Header = "No scripts — create one", IsEnabled = true };
+            none.Click += (_, _) => AddScript();
+            menu.Items.Add(none);
+        }
+        foreach (var f in files)
+        {
+            string cls = Path.GetFileNameWithoutExtension(f);
+            var mi = new MenuItem { Header = $"Attach {cls}" };
+            mi.Click += (_, _) => AttachScriptToSelected(cls);
+            menu.Items.Add(mi);
+        }
+        menu.ShowAt(this);
     }
 }

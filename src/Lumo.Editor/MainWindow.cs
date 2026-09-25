@@ -6,6 +6,7 @@ using Lumo.Engine.Core;
 using Lumo.Editor.Views;
 using System;
 using System.IO;
+using System.Linq;
 
 namespace Lumo.Editor;
 
@@ -21,11 +22,23 @@ public class MainWindow : Window
         MinWidth = 900;
         MinHeight = 600;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
-        Background = new SolidColorBrush(Color.Parse("#0f0f1a"));
+        Background = new SolidColorBrush(Color.Parse("#0a0e17"));
 
         SetWindowIcon();
         BuildUI();
         ShowHome();
+        OpenLastProjectIfRequested();
+    }
+
+    private void OpenLastProjectIfRequested()
+    {
+        if (!Environment.GetCommandLineArgs().Contains("--open-last")) return;
+        try
+        {
+            var last = ProjectManager.GetAllProjects().OrderByDescending(p => p.LastModified).FirstOrDefault();
+            if (last != null) ShowWork(last.Path);
+        }
+        catch { }
     }
 
     private void SetWindowIcon()
