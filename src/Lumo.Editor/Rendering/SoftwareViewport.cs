@@ -37,6 +37,30 @@ public class SoftwareViewport : Control
 
     public bool ShowGizmos { get; set; } = true;
 
+    /// <summary>Raised on viewport click: picked entity, or null on empty space.</summary>
+    public event Action<Entity?>? EntityPicked;
+
+    /// <summary>Raised while a picked entity is being dragged.</summary>
+    public event Action<Entity>? EntityMoved;
+
+    /// <summary>When this returns false, clicks still select but do not move entities.</summary>
+    public Func<bool>? CanEditTransform;
+
+    private Entity? _selected;
+    public Entity? SelectedEntity
+    {
+        get => _selected;
+        set
+        {
+            if (ReferenceEquals(_selected, value)) return;
+            _selected = value;
+            InvalidateVisual();
+        }
+    }
+
+    private Entity? _dragEntity;
+    private Vector3 _dragOffset;
+
     public SoftwareViewport()
     {
         ClipToBounds = true;
@@ -54,12 +78,39 @@ public class SoftwareViewport : Control
         _lastMouse = e.GetPosition(this);
         Focus();
         var p = e.GetCurrentPoint(this).Properties;
-        if (p.IsLeftButtonPressed) _orbiting = true;
+        if (p.IsLeftButtonPressed)
+        {
+            Entity? hit = Mode == ViewportMode.Game ? null : Pick(_lastMouse);
+            if (hit != null)
+            {
+                EntityPicked?.Invoke(hit);
+                if (CanEditTransform?.Invoke() != false)
+                {
+                    var world = ScreenToWorld(_lastMouse, hit.Transform.Position.Z);
+                    if (world is Vector3 w)
+                    {
+                        _dragEntity = hit;
+                        _dragOffset = hit.Transform.Position - w;
+                    }
+                }
+            }
+            else
+            {
+                if (Mode != ViewportMode.Game) EntityPicked?.Invoke(null);
+                _orbiting = true;
+            }
+        }
         else if (p.IsMiddleButtonPressed || p.IsRightButtonPressed) _panning = true;
         e.Handled = true;
     }
 
-    private void OnRelease(object? s, PointerReleasedEventArgs e) { _orbiting = false; _panning = false; e.Handled = true; }
+    private void OnRelease(object? s, PointerReleasedEventArgs e)
+    {
+        _dragEntity = null;
+        _orbiting = false;
+        _panning = false;
+        e.Handled = true;
+    }
 
     private void OnMove(object? s, PointerEventArgs e)
     {
@@ -67,6 +118,19 @@ public class SoftwareViewport : Control
         float dx = (float)(pos.X - _lastMouse.X);
         float dy = (float)(pos.Y - _lastMouse.Y);
         _lastMouse = pos;
+
+        if (_dragEntity != null)
+        {
+            var world = ScreenToWorld(pos, _dragEntity.Transform.Position.Z);
+            if (world is Vector3 w)
+            {
+                var np = w + _dragOffset;
+                _dragEntity.Transform.Position = new Vector3(np.X, np.Y, _dragEntity.Transform.Position.Z);
+                InvalidateVisual();
+                EntityMoved?.Invoke(_dragEntity);
+            }
+            return;
+        }
 
         if (Mode == ViewportMode.Mode2D)
         {
@@ -103,6 +167,143 @@ public class SoftwareViewport : Control
         _camDist = Math.Clamp(_camDist, 0.5f, 100f);
         InvalidateVisual();
         e.Handled = true;
+    }
+
+    // --------------------------------------------------------- picking
+
+    /// <summary>Screen point → world point on the plane Z = planeZ (null in Game view).</summary>
+    private Vector3? ScreenToWorld(Point p, float planeZ)
+    {
+        int w = Math.Max(1, (int)Bounds.Width);
+        int h = Math.Max(1, (int)Bounds.Height);
+        float ndcX = (float)(p.X / w) * 2f - 1f;
+        float ndcY = 1f - (float)(p.Y / h) * 2f;
+
+        if (Mode == ViewportMode.Mode2D)
+        {
+            float halfH = _camDist * 0.5f;
+            float halfW = halfH * ((float)w / h);
+            return _camTarget + new Vector3(ndcX * halfW, ndcY * halfH, 0);
+        }
+
+        if (Mode != ViewportMode.Scene) return null;
+
+        var (pos, fwd, right, up) = GetSceneCamera();
+        float aspect = (float)w / h;
+        float tanHalf = MathF.Tan(60f * MathF.PI / 180f / 2f);
+        var dir = Vector3.Normalize(fwd + right * (ndcX * tanHalf * aspect) + up * (ndcY * tanHalf));
+        if (MathF.Abs(dir.Z) < 1e-6f) return null;
+        float t = (planeZ - pos.Z) / dir.Z;
+        if (t <= 0f) return null;
+        return pos + dir * t;
+    }
+
+    private (Vector3 pos, Vector3 fwd, Vector3 right, Vector3 up) GetSceneCamera()
+    {
+        float yawR = _camYaw * MathF.PI / 180f;
+        float pitchR = _camPitch * MathF.PI / 180f;
+        var pos = _camTarget + new Vector3(
+            _camDist * MathF.Cos(pitchR) * MathF.Sin(yawR),
+            _camDist * MathF.Sin(pitchR),
+            _camDist * MathF.Cos(pitchR) * MathF.Cos(yawR));
+        var fwd = Vector3.Normalize(_camTarget - pos);
+        var right = Vector3.Normalize(Vector3.Cross(fwd, Vector3.UnitY));
+        var up = Vector3.Normalize(Vector3.Cross(right, fwd));
+        return (pos, fwd, right, up);
+    }
+
+    /// <summary>Entity under the cursor (sprites by quad, others by screen radius).</summary>
+    private Entity? Pick(Point p)
+    {
+        if (_scene == null || Mode == ViewportMode.Game) return null;
+        int w = Math.Max(1, (int)Bounds.Width);
+        int h = Math.Max(1, (int)Bounds.Height);
+        var (view, proj) = GetMatrices(w, h);
+        var sp = new Vector2((float)p.X, (float)p.Y);
+
+        Entity? best = null;
+        float bestDepth = float.MinValue;
+        int bestIndex = -1;
+        int index = 0;
+
+        foreach (var entity in _scene.AllEntities)
+        {
+            index++;
+            if (entity.Transform == null || !entity.IsActive) continue;
+            bool hit = false;
+
+            if (entity.MeshRenderer != null)
+            {
+                if (entity.MeshRenderer.IsVisible && InPickRadius(entity, sp, view, proj, w, h)) hit = true;
+            }
+            else if (entity.SpriteRenderer is { IsVisible: true } spr)
+            {
+                var c = entity.Transform.Position;
+                float hw = spr.Width * 0.5f, hh = spr.Height * 0.5f;
+                var a = Project(c + new Vector3(-hw, -hh, 0), view, proj, w, h);
+                var b = Project(c + new Vector3(hw, -hh, 0), view, proj, w, h);
+                var d = Project(c + new Vector3(hw, hh, 0), view, proj, w, h);
+                var e2 = Project(c + new Vector3(-hw, hh, 0), view, proj, w, h);
+                if (a.X > -9000 && PointInQuad(sp, a, b, d, e2)) hit = true;
+            }
+            else if (entity.Light != null || entity.Camera != null)
+            {
+                if (InPickRadius(entity, sp, view, proj, w, h)) hit = true;
+            }
+            else
+            {
+                // bare actor: editor dot
+                var c = Project(entity.Transform.Position, view, proj, w, h);
+                if (c.X > -9000 && Vector2.Distance(sp, c) <= 9f) hit = true;
+            }
+
+            if (!hit) continue;
+            float depth = Vector4.Transform(new Vector4(entity.Transform.Position, 1), view).Z;
+            if (depth > bestDepth || (MathF.Abs(depth - bestDepth) < 1e-4f && index > bestIndex))
+            {
+                best = entity;
+                bestDepth = depth;
+                bestIndex = index;
+            }
+        }
+        return best;
+    }
+
+    private static bool InPickRadius(Entity entity, Vector2 sp, Matrix4x4 view, Matrix4x4 proj, int w, int h)
+    {
+        var c = Project(entity.Transform.Position, view, proj, w, h);
+        if (c.X < -9000) return false;
+        return Vector2.Distance(sp, c) <= PickRadius(entity, view, proj, w, h);
+    }
+
+    private static float PickRadius(Entity entity, Matrix4x4 view, Matrix4x4 proj, int w, int h)
+    {
+        var pos = entity.Transform.Position;
+        float s = MathF.Max(0.1f, MathF.Max(entity.Transform.Scale.X, MathF.Max(entity.Transform.Scale.Y, entity.Transform.Scale.Z)));
+        var c = Project(pos, view, proj, w, h);
+        float r = 13f;
+        var ex = Project(pos + new Vector3(s * 0.5f, 0, 0), view, proj, w, h);
+        var ey = Project(pos + new Vector3(0, s * 0.5f, 0), view, proj, w, h);
+        if (ex.X > -9000) r = MathF.Max(r, Vector2.Distance(c, ex) * 1.7f);
+        if (ey.X > -9000) r = MathF.Max(r, Vector2.Distance(c, ey) * 1.7f);
+        return MathF.Min(r, 90f);
+    }
+
+    private static bool PointInQuad(Vector2 p, Vector2 v0, Vector2 v1, Vector2 v2, Vector2 v3)
+    {
+        bool? positive = null;
+        Span<Vector2> vs = [v0, v1, v2, v3];
+        for (int i = 0; i < 4; i++)
+        {
+            var a = vs[i];
+            var b = vs[(i + 1) % 4];
+            float cross = (b.X - a.X) * (p.Y - a.Y) - (b.Y - a.Y) * (p.X - a.X);
+            if (MathF.Abs(cross) < 1e-3f) continue;
+            bool pos = cross > 0;
+            if (positive is null) positive = pos;
+            else if (positive != pos) return false;
+        }
+        return positive is not false;
     }
 
     private (Matrix4x4 view, Matrix4x4 proj) GetMatrices(int w, int h)
@@ -189,6 +390,7 @@ public class SoftwareViewport : Control
         }
 
         DrawSceneObjects(ctx, view, proj, w, h);
+        DrawSelection(ctx, view, proj, w, h);
 
         string label = Mode switch
         {
@@ -406,6 +608,45 @@ public class SoftwareViewport : Control
             new SolidColorBrush(fill),
             new Pen(new SolidColorBrush(stroke), 1.4),
             geo);
+    }
+
+    private void DrawSelection(DrawingContext ctx, Matrix4x4 view, Matrix4x4 proj, int w, int h)
+    {
+        if (_selected is not { } ent || ent.Transform == null || !ent.IsActive) return;
+        var pen = new Pen(new SolidColorBrush(Color.Parse("#9fe8ff")), 2);
+        var handle = new SolidColorBrush(Color.Parse("#e8fbff"));
+
+        if (ent.SpriteRenderer is { IsVisible: true } spr)
+        {
+            var c = ent.Transform.Position;
+            float hw = spr.Width * 0.5f, hh = spr.Height * 0.5f;
+            var a = Project(c + new Vector3(-hw, -hh, 0), view, proj, w, h);
+            var b = Project(c + new Vector3(hw, -hh, 0), view, proj, w, h);
+            var d = Project(c + new Vector3(hw, hh, 0), view, proj, w, h);
+            var e2 = Project(c + new Vector3(-hw, hh, 0), view, proj, w, h);
+            if (a.X < -9000) return;
+
+            var geo = new StreamGeometry();
+            using (var gc = geo.Open())
+            {
+                gc.BeginFigure(new Point(a.X, a.Y), true);
+                gc.LineTo(new Point(b.X, b.Y));
+                gc.LineTo(new Point(d.X, d.Y));
+                gc.LineTo(new Point(e2.X, e2.Y));
+                gc.EndFigure(true);
+            }
+            ctx.DrawGeometry(null, pen, geo);
+            foreach (var corner in new[] { a, b, d, e2 })
+                ctx.DrawRectangle(handle, null, new Rect(corner.X - 3, corner.Y - 3, 6, 6));
+        }
+        else
+        {
+            var c = Project(ent.Transform.Position, view, proj, w, h);
+            if (c.X < -9000) return;
+            float r = PickRadius(ent, view, proj, w, h) + 4;
+            ctx.DrawEllipse(null, pen, new Point(c.X, c.Y), r, r);
+            ctx.DrawRectangle(handle, null, new Rect(c.X - 3, c.Y - 3, 6, 6));
+        }
     }
 
     private void DrawCube(DrawingContext ctx, Vector3 center, float size, Matrix4x4 view, Matrix4x4 proj, int w, int h, Pen fill, Pen edge)

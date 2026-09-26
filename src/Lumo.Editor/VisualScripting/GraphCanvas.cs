@@ -38,6 +38,9 @@ public sealed class GraphCanvas : Control
 
     public event Action? SelectionChanged;
     public event Action? GraphEdited;
+    public event Action<double>? ZoomChanged;
+
+    public double Zoom => _zoom;
 
     public GraphCanvas()
     {
@@ -399,17 +402,93 @@ public sealed class GraphCanvas : Control
     {
         base.OnPointerWheelChanged(e);
         Point cursor = e.GetPosition(this);
-        Point world = ToWorld(cursor);
         double factor = Math.Pow(1.12, e.Delta.Y);
-        double newZoom = Math.Clamp(_zoom * factor, 0.25, 3.0);
-        _pan = new Point(cursor.X - world.X * newZoom, cursor.Y - world.Y * newZoom);
+        SetZoomAt(_zoom * factor, cursor);
+        e.Handled = true;
+    }
+
+    /// <summary>Zoom keeping the given screen point (world position under it) fixed.</summary>
+    public void SetZoomAt(double zoom, Point anchor)
+    {
+        Point world = ToWorld(anchor);
+        double newZoom = Math.Clamp(zoom, 0.25, 4.0);
+        if (Math.Abs(newZoom - _zoom) < 1e-9) return;
+        _pan = new Point(anchor.X - world.X * newZoom, anchor.Y - world.Y * newZoom);
         _zoom = newZoom;
         InvalidateVisual();
+        ZoomChanged?.Invoke(_zoom);
+    }
+
+    /// <summary>Zoom in/out around the canvas center (toolbar buttons / Ctrl+keys).</summary>
+    public void ZoomBy(double factor)
+    {
+        var center = new Point(Bounds.Width / 2, Bounds.Height / 2);
+        SetZoomAt(_zoom * factor, center);
+    }
+
+    public void ResetZoom() => SetZoomAt(1.0, new Point(Bounds.Width / 2, Bounds.Height / 2));
+
+    /// <summary>Frame all nodes: fit + center the whole graph in the viewport.</summary>
+    public void FitToView()
+    {
+        if (_graph == null || _graph.Nodes.Count == 0 || Bounds.Width < 32 || Bounds.Height < 32)
+        {
+            ResetZoom();
+            return;
+        }
+
+        double minX = double.MaxValue, minY = double.MaxValue;
+        double maxX = double.MinValue, maxY = double.MinValue;
+        foreach (var node in _graph.Nodes)
+        {
+            minX = Math.Min(minX, node.X);
+            minY = Math.Min(minY, node.Y);
+            maxX = Math.Max(maxX, node.X + NodeWidth);
+            maxY = Math.Max(maxY, node.Y + NodeHeight(node));
+        }
+
+        const double pad = 70;
+        double z = Math.Clamp(
+            Math.Min(Bounds.Width / (maxX - minX + pad * 2), Bounds.Height / (maxY - minY + pad * 2)),
+            0.25, 4.0);
+        _zoom = z;
+        _pan = new Point(
+            Bounds.Width / 2 - (minX + maxX) / 2 * z,
+            Bounds.Height / 2 - (minY + maxY) / 2 * z);
+        InvalidateVisual();
+        ZoomChanged?.Invoke(_zoom);
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
+
+        bool ctrl = e.KeyModifiers.HasFlag(KeyModifiers.Control);
+        if (ctrl && (e.Key is Key.OemPlus or Key.Add))
+        {
+            ZoomBy(1.2);
+            e.Handled = true;
+            return;
+        }
+        if (ctrl && (e.Key is Key.OemMinus or Key.Subtract))
+        {
+            ZoomBy(1 / 1.2);
+            e.Handled = true;
+            return;
+        }
+        if (ctrl && (e.Key is Key.D0 or Key.NumPad0))
+        {
+            ResetZoom();
+            e.Handled = true;
+            return;
+        }
+        if (ctrl && e.Key is Key.D9 or Key.NumPad9)
+        {
+            FitToView();
+            e.Handled = true;
+            return;
+        }
+
         if (e.Key == Key.Delete || e.Key == Key.Back)
         {
             DeleteSelection();
@@ -609,10 +688,11 @@ public sealed class GraphCanvas : Control
         return node.GetType().Name;
     }
 
-    private static Color CategoryColor(VSNode node)
-    {
-        string category = node.TypeId.Length > 0 && NodeRegistry.TryGet(node.TypeId, out var def) ? def!.Category : "General";
-        return category switch
+    private static Color CategoryColor(VSNode node) =>
+        CategoryColor(node.TypeId.Length > 0 && NodeRegistry.TryGet(node.TypeId, out var def) ? def!.Category : "General");
+
+    public static Color CategoryColor(string category) =>
+        category switch
         {
             "Events" => Color.Parse("#e05555"),
             "Flow" => Color.Parse("#7c5cf0"),
@@ -624,7 +704,6 @@ public sealed class GraphCanvas : Control
             "Variables" => Color.Parse("#c06ad9"),
             _ => Color.Parse("#5c6580")
         };
-    }
 
     private static Color PinColor(PinDataType type) => type switch
     {

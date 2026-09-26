@@ -2,6 +2,7 @@ using System.Globalization;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Primitives;
+using Avalonia.Controls.Templates;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -21,7 +22,6 @@ public sealed class GraphsPanel : UserControl
     private readonly string _graphsDir;
     private readonly GraphCanvas _canvas = new();
     private readonly List<NodeDefinition> _allDefs;
-    private List<NodeDefinition> _filteredDefs = [];
     private readonly List<string> _files = [];
 
     private ListBox _fileList = null!;
@@ -29,11 +29,19 @@ public sealed class GraphsPanel : UserControl
     private ListBox _palette = null!;
     private StackPanel _propsHost = null!;
     private TextBlock _dirtyMark = null!;
+    private TextBlock _zoomLabel = null!;
     private GraphInterpreter? _runner;
 
     private VisualGraph? _current;
     private string? _currentFile;
     private bool _dirty;
+
+    // palette grouping: category headers + selectable node rows
+    private sealed record PaletteHeader(string Category);
+    private sealed record PaletteItem(NodeDefinition Def);
+
+    private static readonly string[] CategoryOrder =
+        ["Events", "Flow", "Entity", "Actions", "Variables", "Logic", "Math", "Values"];
 
     public event Action<string>? Notify;
 
@@ -41,7 +49,6 @@ public sealed class GraphsPanel : UserControl
     {
         _graphsDir = Path.Combine(projectPath, "Graphs");
         _allDefs = NodeRegistry.All.ToList();
-        _filteredDefs = _allDefs;
         Width = double.NaN;
         BuildUi();
         RefreshFileList();
@@ -238,6 +245,7 @@ public sealed class GraphsPanel : UserControl
             Foreground = UiTheme.B(UiTheme.Text)
         };
         _palette.SelectionChanged += PaletteSelected;
+        _palette.ItemTemplate = new FuncDataTemplate<object>((o, _) => BuildPaletteRow(o), true);
 
         RebuildPalette();
 
@@ -270,30 +278,132 @@ public sealed class GraphsPanel : UserControl
         root.Children.Add(filesBorder);
         root.Children.Add(paletteBorder);
         root.Children.Add(propsBorder);
-        root.Children.Add(_canvas);
+        root.Children.Add(BuildCanvasHost());
         Content = root;
+    }
+
+    private Control BuildCanvasHost()
+    {
+        _zoomLabel = UiTheme.Txt("100%", 11, UiTheme.Dim, FontWeight.SemiBold);
+        _zoomLabel.MinWidth = 40;
+        _zoomLabel.TextAlignment = TextAlignment.Center;
+        _zoomLabel.VerticalAlignment = VerticalAlignment.Center;
+        _canvas.ZoomChanged += z => _zoomLabel.Text = $"{z * 100:F0}%";
+
+        var hint = UiTheme.Txt("wheel zoom · drag bg pan · ctrl±/0/9", 9, UiTheme.Faint);
+        hint.VerticalAlignment = VerticalAlignment.Center;
+        hint.Margin = new Thickness(4, 0, 2, 0);
+
+        var bar = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 5,
+            Children =
+            {
+                UiTheme.ActionButton("−", null, () => _canvas.ZoomBy(1 / 1.2)),
+                UiTheme.ActionButton("100%", null, _canvas.ResetZoom),
+                UiTheme.ActionButton("+", null, () => _canvas.ZoomBy(1.2)),
+                UiTheme.ActionButton("Fit", null, _canvas.FitToView),
+                _zoomLabel,
+                hint
+            }
+        };
+
+        var overlay = new Border
+        {
+            Background = UiTheme.B(Color.Parse("#e610172a")),
+            BorderBrush = UiTheme.B(UiTheme.Border),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(6, 5),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Bottom,
+            Margin = new Thickness(0, 0, 12, 12),
+            Child = bar
+        };
+
+        return new Panel { Children = { _canvas, overlay } };
     }
 
     private void RebuildPalette()
     {
         string q = (_search?.Text ?? "").Trim();
-        _filteredDefs = string.IsNullOrEmpty(q)
+        IEnumerable<NodeDefinition> defs = string.IsNullOrEmpty(q)
             ? _allDefs
             : _allDefs.Where(d =>
                 d.Title.Contains(q, StringComparison.OrdinalIgnoreCase) ||
                 d.Category.Contains(q, StringComparison.OrdinalIgnoreCase) ||
-                d.Type.Contains(q, StringComparison.OrdinalIgnoreCase)).ToList();
+                d.Type.Contains(q, StringComparison.OrdinalIgnoreCase));
+
+        var rows = new List<object>();
+        foreach (var group in defs
+            .GroupBy(d => d.Category)
+            .OrderBy(g =>
+            {
+                int i = Array.IndexOf(CategoryOrder, g.Key);
+                return i >= 0 ? i : CategoryOrder.Length;
+            })
+            .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            rows.Add(new PaletteHeader(group.Key));
+            foreach (var def in group.OrderBy(d => d.Title, StringComparer.OrdinalIgnoreCase))
+                rows.Add(new PaletteItem(def));
+        }
 
         _palette.ItemsSource = null;
-        _palette.ItemsSource = _filteredDefs
-            .Select(d => d.Category + "  ·  " + d.Title)
-            .ToList();
+        _palette.ItemsSource = rows;
+    }
+
+    private Control BuildPaletteRow(object? row)
+    {
+        if (row is PaletteHeader header)
+        {
+            Color color = GraphCanvas.CategoryColor(header.Category);
+            var dot = new Border
+            {
+                Width = 7,
+                Height = 7,
+                CornerRadius = new CornerRadius(3.5),
+                Background = UiTheme.B(color),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            var label = UiTheme.Txt(header.Category.ToUpperInvariant(), 9, UiTheme.Faint, FontWeight.SemiBold);
+            label.LetterSpacing = 1.1;
+            label.VerticalAlignment = VerticalAlignment.Center;
+            var stack = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 6,
+                Margin = new Thickness(8, 10, 0, 2),
+                VerticalAlignment = VerticalAlignment.Center,
+                Children = { dot, label }
+            };
+            return new Border { Background = UiTheme.B(Colors.Transparent), Padding = new Thickness(2, 0), Cursor = new Cursor(StandardCursorType.Arrow), Child = stack };
+        }
+
+        if (row is PaletteItem item)
+        {
+            var title = UiTheme.Txt(item.Def.Title, 11, UiTheme.Text);
+            title.TextTrimming = TextTrimming.CharacterEllipsis;
+            return new Border
+            {
+                Background = UiTheme.B(Colors.Transparent),
+                Padding = new Thickness(18, 3, 4, 3),
+                Cursor = new Cursor(StandardCursorType.Hand),
+                Child = title
+            };
+        }
+
+        return new Border { Height = 0 };
     }
 
     private void PaletteSelected(object? sender, SelectionChangedEventArgs e)
     {
-        if (_palette.SelectedIndex < 0 || _palette.SelectedIndex >= _filteredDefs.Count)
+        if (_palette.SelectedItem is not PaletteItem item)
+        {
+            _palette.SelectedIndex = -1;
             return;
+        }
         if (_current is null)
         {
             Notify?.Invoke("Graphs: open a graph first.");
@@ -302,7 +412,7 @@ public sealed class GraphsPanel : UserControl
         }
         try
         {
-            _canvas.AddNode(_filteredDefs[_palette.SelectedIndex].Type);
+            _canvas.AddNode(item.Def.Type);
             RefreshProps();
         }
         catch (Exception ex)

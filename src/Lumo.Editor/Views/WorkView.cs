@@ -861,6 +861,15 @@ public class WorkView : UserControl
         _glViewport = new GlViewport();
         _softwareViewport = new SoftwareViewport();
         _softwareViewport.Mode = _viewMode;
+        _softwareViewport.EntityPicked += entity =>
+        {
+            _selectedEntity = entity;
+            RefreshHierarchy();
+            RefreshInspector();
+            if (entity != null) Log($"Selected {entity.Name} (viewport).");
+        };
+        _softwareViewport.EntityMoved += _ => RefreshInspector();
+        _softwareViewport.CanEditTransform = () => !_isPlaying;
 
         _viewportPanel = new Panel { Background = UiTheme.B(Color.Parse("#0b1020")) };
 
@@ -1087,6 +1096,8 @@ public class WorkView : UserControl
 
     private void RefreshInspector()
     {
+        if (_softwareViewport != null && !ReferenceEquals(_softwareViewport.SelectedEntity, _selectedEntity))
+            _softwareViewport.SelectedEntity = _selectedEntity;
         if (_inspectorContent == null) return;
         _inspectorContent.Children.Clear();
         if (_selectedEntity == null)
