@@ -46,4 +46,5 @@ public static class Icons
     public const string Monitor = "M21 3H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H3V5h18v12zM5 15h6v2H5v-2z";
     public const string Person = "M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z";
     public const string MoveTool = "M13 6h5v5h-3l4 4-4 4v-3h-5v4h-2v-4H6v-3l4-4H7V6h5V4h1v2zm-4 9v4H6v2h6v-6H9zm6 0h3v6h2v-6h-3v4h-2v-4z";
+    public const string Graph = "M4 7a3 3 0 1 0 6 0a3 3 0 1 0-6 0M14 17a3 3 0 1 0 6 0a3 3 0 1 0-6 0M9 9L15 15";
 }

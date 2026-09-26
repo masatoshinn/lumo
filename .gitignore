@@ -25,3 +25,6 @@ Thumbs.db
 # Build logs
 *.log
 MSBuild_*.failure.txt
+
+# Temp screenshots
+_*.png

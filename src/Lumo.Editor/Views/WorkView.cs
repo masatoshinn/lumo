@@ -8,11 +8,13 @@ using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
 using Lumo.Editor.Rendering;
 using Lumo.Editor.Ui;
+using Lumo.Editor.VisualScripting;
 using Lumo.Engine.Assets;
 using Lumo.Engine.Core;
 using Lumo.Engine.Rendering.Abstractions;
 using Lumo.Engine.Scene;
 using Lumo.Engine.Scripting;
+using Lumo.Engine.VisualScripting;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -39,11 +41,16 @@ public class WorkView : UserControl
     private TextBlock _fpsText = null!;
     private TextBlock _entityCountText = null!;
     private StackPanel _hierarchyList = null!;
+    private StackPanel _fileTreeList = null!;
     private StackPanel _inspectorContent = null!;
     private TextBlock _consoleLog = null!;
     private ContentControl _bottomHost = null!;
+    private ContentControl _centerHost = null!;
+    private ContentControl _rightHost = null!;
+    private Control? _leftHost;
+    private Control? _sceneTabBar;
     private StackPanel _bottomTabsPanel = null!;
-    private StackPanel _sidebarNav = null!;
+    private StackPanel _modeTabsPanel = null!;
     private Panel _viewportPanel = null!;
     private Button _playButton = null!;
     private GlViewport? _glViewport;
@@ -51,10 +58,14 @@ public class WorkView : UserControl
     private Entity? _selectedEntity;
     private bool _isPlaying;
     private ViewportMode _viewMode = ViewportMode.Scene;
-    private string _activeSidebar = "Scene";
-    private string _bottomTab = "Project";
+    private string _topMode = "3D";              // "2D" | "3D" | "Script" | "Game" | "Asset Store"
+    private string _leftTopTab = "Scene";         // "Scene" | "Import"
+    private string _leftBottomTab = "FileSystem"; // "FileSystem" | "History"
+    private string _rightTab = "Inspector";       // "Inspector" | "Signals"
+    private string _bottomTab = "Output";         // "Output" | "Debugger" | "Audio" | "Animation" | "Shader Editor"
     private string _selectedFolder = "";
     private string _hierarchySearch = "";
+    private string _fileFilter = "";
     private string _activeTool = "Move";
     private bool _showGrid = true;
     private bool _showGizmos = true;
@@ -64,9 +75,12 @@ public class WorkView : UserControl
     private string? _currentScriptPath;
     private TextBox? _scriptEditor;
     private TextBlock? _scriptErrorText;
-    private TextBlock? _profilerStats = null!;
+    private TextBlock? _profilerStats;
     private LumoInput? _playInput;
     private readonly ScriptHost _scriptHost = new();
+    private GraphInterpreter? _graphRunner;
+    private GraphsPanel? _graphsPanel;
+    private readonly HashSet<string> _vsLoggedErrors = new();
 
     public WorkView(ProjectInfo project, Action<string?> onNavigateHome, Action onClose)
     {
@@ -134,6 +148,22 @@ public class WorkView : UserControl
 
                 if (_isPlaying)
                 {
+                    try
+                    {
+                        // Graphs tick before BeginFrame so key presses since the
+                        // last frame are still visible to event nodes.
+                        _graphRunner?.Tick(dt);
+                        if (_graphRunner != null)
+                        {
+                            _graphsPanel?.ShowDebug(_graphRunner.ActiveNodes);
+                            foreach (string err in _graphRunner.Errors)
+                            {
+                                if (_vsLoggedErrors.Add(err))
+                                    Log($"VS: {err}");
+                            }
+                        }
+                    }
+                    catch (Exception ex) { Log($"VS tick failed: {ex.Message}"); }
                     _playInput?.BeginFrame();
                     _scriptHost.Update(dt, (float)_engine.Time.ElapsedTime);
                 }
@@ -162,7 +192,6 @@ public class WorkView : UserControl
 
     private void StartPlay()
     {
-        // Snapshot scene so Stop can restore editor state.
         try { _playSnapshot = _scene.Serialize(); }
         catch { _playSnapshot = null; }
 
@@ -188,27 +217,72 @@ public class WorkView : UserControl
             _scriptHost.Bind(_scene);
 
             if (_scriptHost.Errors.Count > 0)
-            {
                 foreach (var err in _scriptHost.Errors)
                     Log(err);
+        }
+
+        _playInput ??= new LumoInput();
+
+        // Load visual scripting graphs for this play session.
+        _graphRunner = new GraphInterpreter
+        {
+            Scene = _scene,
+            Input = _playInput,
+            Self = _selectedEntity
+        };
+        _graphRunner.MessageLogged += OnScriptMessage;
+        _vsLoggedErrors.Clear();
+        string graphsDir = Path.Combine(_project.Path, "Graphs");
+        int graphCount = 0;
+        if (Directory.Exists(graphsDir))
+        {
+            foreach (string file in Directory.GetFiles(graphsDir, "*.graph.json"))
+            {
+                try
+                {
+                    _graphRunner.AddGraph(VisualGraph.Load(file));
+                    graphCount++;
+                }
+                catch (Exception ex)
+                {
+                    Log($"Graph load failed ({Path.GetFileName(file)}): {ex.Message}");
+                }
             }
         }
+        _graphRunner.Start();
+        _graphsPanel?.AttachRunner(_graphRunner);
 
         _engine.Start();
         _scriptHost.Start((float)_engine.Time.ElapsedTime);
         _isPlaying = true;
-        Log(sources.Count > 0
-            ? $"Playing — {sources.Count} script file(s), {_scriptHost.InstanceCount} instance(s)."
-            : "Playing (no scripts in Scripts/).");
+        SetTopMode("Game");
+        if (sources.Count > 0)
+            Log($"Playing — {sources.Count} script file(s), {_scriptHost.InstanceCount} instance(s), {graphCount} graph(s).");
+        else if (graphCount > 0)
+            Log($"Playing — {graphCount} visual graph(s).");
+        else
+            Log("Playing (no scripts in Scripts/, no graphs in Graphs/).");
     }
 
     private void StopPlay()
     {
         _scriptHost.Stop();
+        if (_graphRunner != null)
+        {
+            foreach (string err in _graphRunner.Errors)
+            {
+                if (_vsLoggedErrors.Add(err))
+                    Log($"VS: {err}");
+            }
+            _graphRunner.MessageLogged -= OnScriptMessage;
+            _graphRunner.Clear();
+            _graphRunner = null;
+        }
+        _graphsPanel?.AttachRunner(null);
+        _graphsPanel?.ShowDebug([]);
         _engine.Stop();
         _isPlaying = false;
 
-        // Restore scene to pre-play state.
         if (_playSnapshot != null)
         {
             try
@@ -236,14 +310,11 @@ public class WorkView : UserControl
     private void RefreshPlayButton()
     {
         if (_playButton == null) return;
-        _playButton.Content = UiTheme.ActionButton(
-            _isPlaying ? "Stop" : "Play",
-            _isPlaying ? Icons.Stop : Icons.Play,
-            null, primary: true).Content;
+        _playButton.Content = UiTheme.Ico(_isPlaying ? Icons.Stop : Icons.Play, 16, Colors.White);
         _playButton.Background = UiTheme.B(_isPlaying ? UiTheme.Red : UiTheme.Accent);
     }
 
-    // ================= UI =================
+    // ================= UI root =================
     private void BuildUI()
     {
         _consoleLog = new TextBlock { Text = "", Foreground = UiTheme.B(UiTheme.Green), FontFamily = UiTheme.Mono, FontSize = 11, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(10, 8) };
@@ -254,73 +325,83 @@ public class WorkView : UserControl
         DockPanel.SetDock(topbar, Dock.Top);
         root.Children.Add(topbar);
 
-        var sidebar = BuildSidebar();
-        DockPanel.SetDock(sidebar, Dock.Left);
-        root.Children.Add(sidebar);
+        var bottom = BuildBottomPanel();
+        DockPanel.SetDock(bottom, Dock.Bottom);
+        root.Children.Add(bottom);
 
-        var status = BuildStatusBar();
-        DockPanel.SetDock(status, Dock.Bottom);
-        root.Children.Add(status);
+        _leftHost = BuildLeftPanel();
+        DockPanel.SetDock(_leftHost, Dock.Left);
+        root.Children.Add(_leftHost);
 
-        root.Children.Add(BuildEditorArea());
+        _rightHost = new ContentControl();
+        DockPanel.SetDock(_rightHost, Dock.Right);
+        root.Children.Add(_rightHost);
+        RebuildRight();
+
+        root.Children.Add(BuildCenterArea());
         Content = root;
     }
 
-    // ---------- Top bar ----------
+    // ---------- Top bar: menu + mode tabs + playback ----------
     private Control BuildTopBar()
     {
-        var left = new StackPanel
+        var menu = new StackPanel
         {
             Orientation = Orientation.Horizontal,
-            Spacing = 8,
+            Spacing = 4,
             VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(12, 0),
+            Margin = new Thickness(14, 0, 0, 0),
             Children =
             {
-                UiTheme.Logo(22),
-                UiTheme.IconBtn(Icons.Home, () => _onNavigateHome?.Invoke(null)),
-                new Border
-                {
-                    Background = UiTheme.B(UiTheme.Card),
-                    BorderBrush = UiTheme.B(UiTheme.Border),
-                    BorderThickness = new Thickness(1),
-                    CornerRadius = new CornerRadius(7),
-                    Padding = new Thickness(11, 6),
-                    Cursor = new Cursor(StandardCursorType.Hand),
-                    Child = new StackPanel
-                    {
-                        Orientation = Orientation.Horizontal,
-                        Spacing = 8,
-                        Children =
-                        {
-                            UiTheme.Ico(Icons.Cube, 14, UiTheme.Cyan),
-                            UiTheme.Txt(_project.Name, 12, UiTheme.Text, FontWeight.Medium),
-                            UiTheme.Ico(Icons.ChevronDown, 13, UiTheme.Dim),
-                        }
-                    },
-                },
+                MenuLabel("Scene", NewScene),
+                MenuLabel("Project", BuildProject),
+                MenuLabel("Graphs", () => SetTopMode("Graphs")),
+                MenuLabel("Debug", () => { _bottomTab = "Debugger"; RebuildBottom(); }),
+                MenuLabel("Editor", OpenSettings),
+                MenuLabel("Help", () => Log($"{EngineConstants.Name} v{EngineConstants.Version}")),
             }
         };
+        DockPanel.SetDock(menu, Dock.Left);
 
-        _playButton = UiTheme.ActionButton("Play", Icons.Play, () => TogglePlay(), primary: true);
-        _playButton.Padding = new Thickness(18, 7);
-        _playButton.HorizontalAlignment = HorizontalAlignment.Left;
+        _modeTabsPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
+        RebuildModeTabs();
 
-        var platform = new Border
+        _playButton = new Button
         {
-            Background = UiTheme.B(UiTheme.Card),
-            BorderBrush = UiTheme.B(UiTheme.Border),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(7),
-            Padding = new Thickness(11, 7),
-            Child = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 7,
-                Children = { UiTheme.Ico(Icons.Monitor, 14, UiTheme.Dim), UiTheme.Txt("Windows (x64)", 12, UiTheme.Text), UiTheme.Ico(Icons.ChevronDown, 13, UiTheme.Dim) },
-            },
+            Content = UiTheme.Ico(Icons.Play, 16, Colors.White),
+            Width = 34, Height = 28,
+            Background = UiTheme.B(UiTheme.Accent),
+            BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(6),
             Cursor = new Cursor(StandardCursorType.Hand),
         };
+        _playButton.Click += (_, _) => TogglePlay();
+
+        var stopButton = new Button
+        {
+            Content = UiTheme.Ico(Icons.Stop, 15, UiTheme.Dim),
+            Width = 30, Height = 28,
+            Background = UiTheme.B(Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            CornerRadius = new CornerRadius(6),
+            Cursor = new Cursor(StandardCursorType.Hand),
+        };
+        stopButton.Click += (_, _) => { if (_isPlaying) TogglePlay(); };
+
+        var statusText = UiTheme.Txt("Ready", 11, UiTheme.Faint);
+        _statusText = statusText;
+        statusText.MaxWidth = 180;
+        statusText.TextTrimming = TextTrimming.CharacterEllipsis;
+        statusText.TextWrapping = TextWrapping.NoWrap;
+        statusText.VerticalAlignment = VerticalAlignment.Center;
+
+        _fpsText = UiTheme.Txt("FPS: 0", 11, UiTheme.Green, FontWeight.Medium);
+        _fpsText.VerticalAlignment = VerticalAlignment.Center;
+        _fpsText.Margin = new Thickness(8, 0, 0, 0);
+
+        _entityCountText = UiTheme.Txt("0 objects", 11, UiTheme.Dim);
+        _entityCountText.VerticalAlignment = VerticalAlignment.Center;
+        _entityCountText.Margin = new Thickness(8, 0, 0, 0);
 
         var right = new StackPanel
         {
@@ -330,260 +411,338 @@ public class WorkView : UserControl
             Margin = new Thickness(0, 0, 14, 0),
             Children =
             {
+                statusText,
+                _entityCountText,
+                _fpsText,
                 _playButton,
-                platform,
-                UiTheme.IconBtn(Icons.Rocket, BuildProject),
-                UiTheme.IconBtn(Icons.Gear, OpenSettings),
-                UiTheme.IconBtn(Icons.Help, () => Log($"{EngineConstants.Name} v{EngineConstants.Version}")),
-                BuildUserChip(),
+                stopButton,
+                UiTheme.IconBtn(Icons.Rocket, BuildProject, 15),
+                UiTheme.IconBtn(Icons.Gear, OpenSettings, 15),
             }
         };
         DockPanel.SetDock(right, Dock.Right);
 
-        var bar = new DockPanel { Height = 52, Background = UiTheme.B(UiTheme.Sidebar), Children = { right, left } };
+        var bar = new DockPanel { Height = 40, Background = UiTheme.B(UiTheme.Sidebar) };
+        bar.Children.Add(menu);
+        bar.Children.Add(right);
+        bar.Children.Add(new Border { Child = _modeTabsPanel, HorizontalAlignment = HorizontalAlignment.Center });
+
         return new Border { BorderBrush = UiTheme.B(UiTheme.Border), BorderThickness = new Thickness(0, 0, 0, 1), Child = bar };
     }
 
-    private Control BuildUserChip()
+    private static Button MenuLabel(string text, Action onClick)
     {
-        return new StackPanel
+        var b = new Button
         {
-            Orientation = Orientation.Horizontal,
-            Spacing = 9,
-            Margin = new Thickness(8, 0, 0, 0),
-            Children =
-            {
-                new Border
-                {
-                    Width = 30, Height = 30, CornerRadius = new CornerRadius(15),
-                    Background = new LinearGradientBrush
-                    {
-                        StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
-                        EndPoint = new RelativePoint(1, 1, RelativeUnit.Relative),
-                        GradientStops = { new GradientStop(UiTheme.Accent, 0), new GradientStop(UiTheme.Purple, 1) },
-                    },
-                    Child = UiTheme.Txt("G", 13, Colors.White, FontWeight.Bold),
-                },
-                new StackPanel
-                {
-                    Spacing = -1,
-                    VerticalAlignment = VerticalAlignment.Center,
-                    Children =
-                    {
-                        UiTheme.Txt("Golam Mostofa Sadhin", 12, UiTheme.Text, FontWeight.SemiBold),
-                        UiTheme.Txt("Creator", 10, UiTheme.Faint),
-                    }
-                },
-                UiTheme.Ico(Icons.ChevronDown, 14, UiTheme.Dim),
-            }
-        };
-    }
-
-    // ---------- Sidebar ----------
-    private Control BuildSidebar()
-    {
-        var side = new StackPanel { Width = 226, Background = UiTheme.B(UiTheme.Sidebar) };
-
-        side.Children.Add(new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Spacing = 10,
-            Margin = new Thickness(16, 14, 16, 18),
-            Children =
-            {
-                UiTheme.Logo(24),
-                new StackPanel { Spacing = -2, Children = { UiTheme.Txt("Lumo", 17, UiTheme.Text, FontWeight.Bold), UiTheme.Txt("Game Engine", 9, UiTheme.Faint) } },
-            }
-        });
-
-        side.Children.Add(SideLabel("Project"));
-        _sidebarNav = new StackPanel();
-        RebuildSidebarNav();
-        side.Children.Add(_sidebarNav);
-
-        side.Children.Add(SideLabel("Quick Actions"));
-        var actions = new StackPanel();
-        foreach (var (icon, name, act) in new (string, string, Action)[]
-        {
-            (Icons.FilePlus, "New Scene", NewScene),
-            (Icons.Upload, "Import Asset", () => _ = ImportAssetAsync()),
-            (Icons.Code, "Add Script", AddScript),
-            (Icons.Rocket, "Build Project", BuildProject),
-        })
-        {
-            var b = new Border
-            {
-                Margin = new Thickness(10, 3),
-                Padding = new Thickness(12, 9),
-                CornerRadius = new CornerRadius(8),
-                Background = UiTheme.B(UiTheme.Card),
-                BorderBrush = UiTheme.B(UiTheme.Border),
-                BorderThickness = new Thickness(1),
-                Cursor = new Cursor(StandardCursorType.Hand),
-                Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, Children = { UiTheme.Ico(icon, 15, UiTheme.Cyan), UiTheme.Txt(name, 12, UiTheme.Text) } },
-            };
-            b.PointerEntered += (_, _) => b.Background = UiTheme.B(UiTheme.CardHover);
-            b.PointerExited += (_, _) => b.Background = UiTheme.B(UiTheme.Card);
-            b.PointerPressed += (_, _) => act();
-            actions.Children.Add(b);
-        }
-        side.Children.Add(actions);
-
-        // promo
-        side.Children.Add(new Border
-        {
-            Margin = new Thickness(12, 16, 12, 8),
-            CornerRadius = new CornerRadius(10),
-            Padding = new Thickness(14, 16),
-            Background = new LinearGradientBrush
-            {
-                StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
-                EndPoint = new RelativePoint(1, 1, RelativeUnit.Relative),
-                GradientStops = { new GradientStop(Color.Parse("#1b2559"), 0), new GradientStop(Color.Parse("#2a1b52"), 1) },
-            },
-            Child = new StackPanel
-            {
-                Spacing = 6,
-                HorizontalAlignment = HorizontalAlignment.Center,
-                Children =
-                {
-                    UiTheme.Logo(26),
-                    UiTheme.TxtAt("Build Worlds", 13, UiTheme.Text, FontWeight.Bold, HorizontalAlignment.Center),
-                    UiTheme.TxtAt("Create Stories", 13, UiTheme.Text, FontWeight.Bold, HorizontalAlignment.Center),
-                    new StackPanel
-                    {
-                        Orientation = Orientation.Horizontal,
-                        Spacing = 6,
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                        Margin = new Thickness(0, 6, 0, 0),
-                        Children = { UiTheme.Logo(13), UiTheme.Txt("Lumo", 12, UiTheme.Text, FontWeight.SemiBold) },
-                    },
-                }
-            }
-        });
-
-        side.Children.Add(new Border
-        {
-            Height = 26,
-            Background = UiTheme.B(UiTheme.Panel),
-            Child = new DockPanel
-            {
-                Children =
-                {
-                    new StackPanel
-                    {
-                        Orientation = Orientation.Horizontal, Spacing = 6,
-                        Margin = new Thickness(14, 0),
-                        VerticalAlignment = VerticalAlignment.Center,
-                        Children =
-                        {
-                            new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4), Background = UiTheme.B(UiTheme.Green), VerticalAlignment = VerticalAlignment.Center },
-                            UiTheme.Txt("Online", 10, UiTheme.Green),
-                        }
-                    },
-                    new TextBlock
-                    {
-                        Text = "v0.1.0 (Beta)",
-                        FontSize = 10,
-                        Foreground = UiTheme.B(UiTheme.Faint),
-                        VerticalAlignment = VerticalAlignment.Center,
-                        Margin = new Thickness(0, 0, 14, 0),
-                        HorizontalAlignment = HorizontalAlignment.Right,
-                    }
-                }
-            }
-        });
-
-        return side;
-    }
-
-    private static TextBlock SideLabel(string text)
-        => new() { Text = text, FontSize = 10, Foreground = UiTheme.B(UiTheme.Faint), FontWeight = FontWeight.SemiBold, Margin = new Thickness(22, 10, 0, 5), LetterSpacing = 1.2 };
-
-    private Control SideBtn(string icon, string label)
-    {
-        bool active = label == _activeSidebar;
-        var btn = new Button
-        {
-            Content = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 12,
-                VerticalAlignment = VerticalAlignment.Center,
-                Children = { UiTheme.Ico(icon, 15, active ? Color.Parse("#8fa4ff") : UiTheme.Dim), UiTheme.Txt(label, 12, active ? UiTheme.Text : UiTheme.Dim, active ? FontWeight.SemiBold : FontWeight.Normal) },
-            },
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-            HorizontalContentAlignment = HorizontalAlignment.Left,
-            Padding = new Thickness(14, 8),
-            Margin = new Thickness(10, 1),
-            Background = active ? UiTheme.B(Color.Parse("#1c2a6b")) : UiTheme.B(Colors.Transparent),
-            Foreground = UiTheme.B(UiTheme.Dim),
+            Content = UiTheme.Txt(text, 12, UiTheme.Dim),
+            Background = UiTheme.B(Colors.Transparent),
             BorderThickness = new Thickness(0),
-            CornerRadius = new CornerRadius(7),
+            Padding = new Thickness(9, 6),
             Cursor = new Cursor(StandardCursorType.Hand),
         };
-        if (!active)
+        b.Click += (_, _) => onClick();
+        return b;
+    }
+
+    private void RebuildModeTabs()
+    {
+        if (_modeTabsPanel == null) return;
+        _modeTabsPanel.Children.Clear();
+        foreach (var mode in new[] { "2D", "3D", "Script", "Graphs", "Game" })
+            _modeTabsPanel.Children.Add(ModeTab(mode));
+        _modeTabsPanel.Children.Add(new Border { Width = 1, Height = 16, Background = UiTheme.B(UiTheme.Border), Margin = new Thickness(8, 0), VerticalAlignment = VerticalAlignment.Center });
+        _modeTabsPanel.Children.Add(ModeTab("Asset Store", Icons.Upload));
+    }
+
+    private Control ModeTab(string label, string? icon = null)
+    {
+        bool active = label == _topMode;
+        var content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+        if (icon != null) content.Children.Add(UiTheme.Ico(icon, 13, active ? UiTheme.Cyan : UiTheme.Dim));
+        content.Children.Add(UiTheme.Txt(label, 12, active ? UiTheme.Cyan : UiTheme.Dim, active ? FontWeight.SemiBold : FontWeight.Normal));
+
+        var b = new Button
         {
-            btn.PointerEntered += (_, _) => btn.Background = UiTheme.B(Color.Parse("#151d38"));
-            btn.PointerExited += (_, _) => btn.Background = UiTheme.B(Colors.Transparent);
+            Content = content,
+            Background = UiTheme.B(Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(10, 8),
+            Cursor = new Cursor(StandardCursorType.Hand),
+        };
+        b.Click += (_, _) => SetTopMode(label);
+        return b;
+    }
+
+    private void SetTopMode(string mode)
+    {
+        _topMode = mode;
+        RebuildModeTabs();
+        _viewMode = mode switch { "2D" => ViewportMode.Mode2D, "Game" => ViewportMode.Game, _ => ViewportMode.Scene };
+        if (_softwareViewport != null) { _softwareViewport.Mode = _viewMode; _softwareViewport.InvalidateVisual(); }
+        RebuildCenter();
+
+        // Graphs mode: only header + graph workspace (hide side/bottom panels for max canvas)
+        bool graphs = mode == "Graphs";
+        if (_leftHost != null) _leftHost.IsVisible = !graphs;
+        _rightHost.IsVisible = !graphs;
+        _bottomHost.IsVisible = !graphs;
+        if (_sceneTabBar != null) _sceneTabBar.IsVisible = !graphs;
+    }
+
+    // ---------- Left panel: Scene tree (top) + FileSystem (bottom) ----------
+    private Control BuildLeftPanel()
+    {
+        var grid = new Grid
+        {
+            Width = 286,
+            RowDefinitions =
+            {
+                new RowDefinition(new GridLength(1, GridUnitType.Star)),
+                new RowDefinition(new GridLength(1, GridUnitType.Star)),
+            }
+        };
+
+        var top = BuildSceneDock();
+        var bottom = BuildFileSystemDock();
+        Grid.SetRow(top, 0);
+        Grid.SetRow(bottom, 1);
+        grid.Children.Add(top);
+        grid.Children.Add(bottom);
+
+        var splitLine = new Border { Background = UiTheme.B(UiTheme.Border), Height = 1, VerticalAlignment = VerticalAlignment.Top };
+        Grid.SetRow(splitLine, 1);
+        grid.Children.Add(splitLine);
+
+        return new Border { Background = UiTheme.B(UiTheme.Sidebar), BorderBrush = UiTheme.B(UiTheme.Border), BorderThickness = new Thickness(0, 0, 1, 0), Child = grid };
+    }
+
+    private Control BuildSceneDock()
+    {
+        var tabs = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Height = 30,
+            Children = { DockTab("Scene", () => { _leftTopTab = "Scene"; RebuildLeftTop(); }, () => _leftTopTab), DockTab("Import", () => { _leftTopTab = "Import"; RebuildLeftTop(); }, () => _leftTopTab) }
+        };
+
+        var toolbar = new DockPanel { Height = 32, Margin = new Thickness(8, 2) };
+        var more = UiTheme.IconBtn(Icons.Dots, () => { }, 14);
+        DockPanel.SetDock(more, Dock.Right);
+        var search = new TextBox
+        {
+            Watermark = "Filter Nodes", FontSize = 11, Height = 26,
+            Background = UiTheme.B(UiTheme.Bg), Foreground = UiTheme.B(UiTheme.Text),
+            BorderBrush = UiTheme.B(UiTheme.Border), BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(5), Padding = new Thickness(8, 3),
+            Margin = new Thickness(6, 0),
+        };
+        search.TextChanged += (_, _) => { _hierarchySearch = search.Text ?? ""; RefreshHierarchy(); };
+        var addBtn = UiTheme.IconBtn(Icons.Plus, () => CreateEntity("Empty Actor"), 15);
+        toolbar.Children.Add(more);
+        toolbar.Children.Add(addBtn);
+        toolbar.Children.Add(search);
+
+        _hierarchyList = new StackPanel { Spacing = 1 };
+        var scroll = new ScrollViewer { Content = _hierarchyList, Background = UiTheme.B(UiTheme.Bg) };
+
+        var content = new DockPanel();
+        DockPanel.SetDock(tabs, Dock.Top);
+        DockPanel.SetDock(toolbar, Dock.Top);
+        content.Children.Add(tabs);
+        content.Children.Add(toolbar);
+        content.Children.Add(_leftTopTab == "Scene" ? scroll : ImportPlaceholder());
+
+        RefreshHierarchy();
+        return content;
+    }
+
+    private void RebuildLeftTop()
+    {
+        // rebuild whole left panel to reflect tab switch (simple + reliable)
+        RebuildLeft();
+    }
+
+    private void RebuildLeft()
+    {
+        if (Content is not DockPanel dp) return;
+        var old = dp.Children.FirstOrDefault(c => DockPanel.GetDock(c) == Dock.Left);
+        if (old != null) dp.Children.Remove(old);
+        _leftHost = BuildLeftPanel();
+        _leftHost.IsVisible = _topMode != "Graphs";
+        DockPanel.SetDock(_leftHost, Dock.Left);
+        dp.Children.Insert(0, _leftHost);
+    }
+
+    private static Control ImportPlaceholder() => new StackPanel
+    {
+        Margin = new Thickness(14, 30), Spacing = 6, HorizontalAlignment = HorizontalAlignment.Center,
+        Children = { UiTheme.Ico(Icons.Upload, 26, UiTheme.Faint), UiTheme.TxtAt("Select a file to see import options.", 11, UiTheme.Faint, FontWeight.Normal, HorizontalAlignment.Center) }
+    };
+
+    private Control BuildFileSystemDock()
+    {
+        var tabs = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Height = 30,
+            Children = { DockTab("FileSystem", () => { _leftBottomTab = "FileSystem"; RebuildLeft(); }, () => _leftBottomTab), DockTab("History", () => { _leftBottomTab = "History"; RebuildLeft(); }, () => _leftBottomTab) }
+        };
+
+        var pathRow = new DockPanel { Height = 30, Margin = new Thickness(8, 4, 8, 2) };
+        var newFolderBtn = UiTheme.IconBtn(Icons.FolderOutline, () => { }, 14);
+        DockPanel.SetDock(newFolderBtn, Dock.Right);
+        var backBtn = UiTheme.IconBtn(Icons.ChevronRight, () => { }, 13);
+        var pathBox = new Border
+        {
+            Background = UiTheme.B(UiTheme.Bg), BorderBrush = UiTheme.B(UiTheme.Border), BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(5), Padding = new Thickness(8, 4), Margin = new Thickness(6, 0),
+            Child = UiTheme.Txt("res://", 11, UiTheme.Text),
+        };
+        pathRow.Children.Add(newFolderBtn);
+        pathRow.Children.Add(pathBox);
+
+        var filterRow = new DockPanel { Height = 30, Margin = new Thickness(8, 0, 8, 4) };
+        var sortBtn = UiTheme.IconBtn(Icons.Dots, () => { }, 14);
+        DockPanel.SetDock(sortBtn, Dock.Right);
+        var filter = new TextBox
+        {
+            Watermark = "Filter Files", FontSize = 11, Height = 26,
+            Background = UiTheme.B(UiTheme.Bg), Foreground = UiTheme.B(UiTheme.Text),
+            BorderBrush = UiTheme.B(UiTheme.Border), BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(5), Padding = new Thickness(8, 3), Margin = new Thickness(0, 0, 6, 0),
+        };
+        filter.TextChanged += (_, _) => { _fileFilter = filter.Text ?? ""; RefreshFileTree(); };
+        filterRow.Children.Add(sortBtn);
+        filterRow.Children.Add(filter);
+
+        _fileTreeList = new StackPanel { Spacing = 1 };
+        var scroll = new ScrollViewer { Content = _fileTreeList, Background = UiTheme.B(UiTheme.Bg) };
+
+        var content = new DockPanel();
+        DockPanel.SetDock(tabs, Dock.Top);
+        DockPanel.SetDock(pathRow, Dock.Top);
+        DockPanel.SetDock(filterRow, Dock.Top);
+        content.Children.Add(tabs);
+        if (_leftBottomTab == "FileSystem")
+        {
+            content.Children.Add(pathRow);
+            content.Children.Add(filterRow);
+            content.Children.Add(scroll);
+            RefreshFileTree();
         }
-        btn.Click += (_, _) => SidebarNavigate(label);
-        return btn;
+        else
+        {
+            content.Children.Add(new StackPanel { Margin = new Thickness(14, 30), Spacing = 6, HorizontalAlignment = HorizontalAlignment.Center, Children = { UiTheme.Ico(Icons.Terminal, 26, UiTheme.Faint), UiTheme.TxtAt("No file history yet.", 11, UiTheme.Faint, FontWeight.Normal, HorizontalAlignment.Center) } });
+        }
+
+        return content;
     }
 
-    private void RebuildSidebarNav()
+    private static Control DockTab(string label, Action onClick, Func<string> currentGetter)
     {
-        if (_sidebarNav == null) return;
-        _sidebarNav.Children.Clear();
-        foreach (var (icon, name) in new[]
+        bool active = label == currentGetter();
+        var b = new Button
         {
-            (Icons.Dashboard, "Overview"), (Icons.Scene, "Scene"), (Icons.Box, "Game Objects"),
-            (Icons.Folder, "Assets"), (Icons.Code, "Scripts"), (Icons.Rocket, "Build & Run"), (Icons.Gear, "Settings"),
-        })
-            _sidebarNav.Children.Add(SideBtn(icon, name));
+            Content = UiTheme.Txt(label, 11, active ? UiTheme.Text : UiTheme.Faint, active ? FontWeight.SemiBold : FontWeight.Normal),
+            Background = UiTheme.B(active ? UiTheme.Panel : Colors.Transparent),
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(11, 6),
+            Cursor = new Cursor(StandardCursorType.Hand),
+        };
+        b.Click += (_, _) => onClick();
+        return b;
     }
 
-    private void SidebarNavigate(string label)
+    private void RefreshFileTree()
     {
-        _activeSidebar = label;
-        RebuildSidebarNav();
+        if (_fileTreeList == null) return;
+        _fileTreeList.Children.Clear();
 
-        switch (label)
+        _fileTreeList.Children.Add(FsRow("Favorites", Icons.Star, 0, header: true));
+
+        string root = _project.Path;
+        string label = string.IsNullOrEmpty(root) ? "res://" : "res://";
+        _fileTreeList.Children.Add(FsRow(label, Icons.FolderOutline, 0, path: root, isFolder: true));
+
+        if (!Directory.Exists(root)) return;
+
+        var dirs = Directory.GetDirectories(root).Where(d => !d.EndsWith("bin") && !d.EndsWith("obj")).OrderBy(Path.GetFileName);
+        foreach (var d in dirs)
         {
-            case "Assets":
-                _bottomTab = "Project";
-                _selectedFolder = Path.Combine(_project.Path, "Assets");
-                RebuildBottom();
-                break;
-            case "Scripts":
-                _bottomTab = "Scripts";
-                RebuildBottom();
-                break;
-            case "Build & Run":
-                BuildProject();
-                break;
-            case "Settings":
-                OpenSettings();
-                break;
-            case "Game Objects":
-                _bottomTab = "Project";
-                RebuildBottom();
-                Log($"{_scene.AllEntities.Count} game objects in scene.");
-                break;
-            case "Scene":
-                _bottomTab = "Console";
-                RebuildBottom();
-                break;
-            case "Overview":
-                _onNavigateHome?.Invoke(null);
-                break;
+            var name = Path.GetFileName(d);
+            if (_fileFilter.Length > 0 && !name.Contains(_fileFilter, StringComparison.OrdinalIgnoreCase)) continue;
+            _fileTreeList.Children.Add(FsRow(name + "/", Icons.FolderOutline, 1, path: d, isFolder: true));
+        }
+
+        var files = Directory.GetFiles(root).OrderBy(Path.GetFileName);
+        foreach (var f in files)
+        {
+            var name = Path.GetFileName(f);
+            if (_fileFilter.Length > 0 && !name.Contains(_fileFilter, StringComparison.OrdinalIgnoreCase)) continue;
+            var ext = Path.GetExtension(f).ToLowerInvariant();
+            _fileTreeList.Children.Add(FsRow(name, ext == ".cs" ? Icons.Code : Icons.File, 1, path: f, isFolder: false));
         }
     }
 
-    // ---------- Editor area ----------
-    private Control BuildEditorArea()
+    private Control FsRow(string label, string icon, int indent, string? path = null, bool isFolder = false, bool header = false)
     {
-        // Scene tab strip
+        bool selected = path != null && _selectedFolder == path;
+        var row = new Border
+        {
+            Background = selected ? UiTheme.B(Color.Parse("#1c2a6b")) : UiTheme.B(Colors.Transparent),
+            Padding = new Thickness(10 + indent * 16, 5, 10, 5),
+            Margin = new Thickness(4, 0),
+            CornerRadius = new CornerRadius(5),
+            Cursor = path != null ? new Cursor(StandardCursorType.Hand) : Cursor.Default,
+            Child = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                Children = { UiTheme.Ico(icon, 13, header ? UiTheme.Orange : (selected ? UiTheme.Cyan : UiTheme.Dim)), UiTheme.Txt(label, 11, selected ? UiTheme.Text : UiTheme.Dim) },
+            },
+        };
+        if (path != null && !selected)
+        {
+            row.PointerEntered += (_, _) => row.Background = UiTheme.B(Color.Parse("#151d38"));
+            row.PointerExited += (_, _) => row.Background = UiTheme.B(Colors.Transparent);
+        }
+        if (path != null)
+        {
+            row.PointerPressed += (_, _) =>
+            {
+                _selectedFolder = path;
+                if (!isFolder)
+                {
+                    var ext = Path.GetExtension(path).ToLowerInvariant();
+                    if (ext == ".cs") { OpenScript(path); SetTopMode("Script"); }
+                    else if (ext == ".obj") ImportObjFile(path);
+                    else Log($"Opened {Path.GetFileName(path)}");
+                }
+                RefreshFileTree();
+            };
+        }
+        return row;
+    }
+
+    // ---------- Center: tab strip + (viewport toolbar + viewport) | script editor | asset store ----------
+    private Control BuildCenterArea()
+    {
+        var grid = new Grid { RowDefinitions = { new RowDefinition(GridLength.Auto), new RowDefinition(new GridLength(1, GridUnitType.Star)) } };
+
+        _sceneTabBar = BuildSceneTabBar();
+        Grid.SetRow(_sceneTabBar, 0);
+        grid.Children.Add(_sceneTabBar);
+
+        _centerHost = new ContentControl();
+        Grid.SetRow(_centerHost, 1);
+        grid.Children.Add(_centerHost);
+
+        RebuildCenter();
+        return grid;
+    }
+
+    private Control BuildSceneTabBar()
+    {
         var sceneTab = new Border
         {
             Background = UiTheme.B(UiTheme.Panel),
@@ -595,12 +754,7 @@ public class WorkView : UserControl
             {
                 Orientation = Orientation.Horizontal,
                 Spacing = 8,
-                Children =
-                {
-                    UiTheme.Ico(Icons.Scene, 13, UiTheme.Cyan),
-                    UiTheme.Txt($"{_project.Name}.scene", 12, UiTheme.Text, FontWeight.Medium),
-                    UiTheme.Ico(Icons.Close, 13, UiTheme.Faint),
-                }
+                Children = { UiTheme.Ico(Icons.Scene, 13, UiTheme.Cyan), UiTheme.Txt($"[{_project.Name}] (*)", 12, UiTheme.Text, FontWeight.Medium), UiTheme.Ico(Icons.Close, 13, UiTheme.Faint) }
             },
             Cursor = new Cursor(StandardCursorType.Hand),
         };
@@ -612,56 +766,93 @@ public class WorkView : UserControl
             Padding = new Thickness(9, 5),
             Cursor = new Cursor(StandardCursorType.Hand),
         };
+        plusTab.Click += (_, _) => NewScene();
 
-        var tabBar = new Border
+        return new Border
         {
             Background = UiTheme.B(UiTheme.Bg),
             Padding = new Thickness(10, 6, 0, 0),
             Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3, Children = { sceneTab, plusTab } },
         };
+    }
 
-        // content: viewport | hierarchy | inspector
+    private void RebuildCenter()
+    {
+        if (_centerHost == null) return;
+        _centerHost.Content = _topMode switch
+        {
+            "Script" => BuildScriptsPanel(),
+            "Graphs" => BuildGraphsPanel(),
+            "Asset Store" => BuildAssetStorePlaceholder(),
+            _ => BuildViewportArea(),
+        };
+    }
+
+    private Control BuildAssetStorePlaceholder() => new StackPanel
+    {
+        Margin = new Thickness(30, 60), Spacing = 8, HorizontalAlignment = HorizontalAlignment.Center,
+        Children = { UiTheme.Ico(Icons.Upload, 40, UiTheme.Faint), UiTheme.TxtAt("Lumo Asset Store", 15, UiTheme.Dim, FontWeight.Medium, HorizontalAlignment.Center), UiTheme.TxtAt("Not connected yet.", 11, UiTheme.Faint, FontWeight.Normal, HorizontalAlignment.Center) }
+    };
+
+    // ---------- Visual scripting (Graphs mode) ----------
+    private Control BuildGraphsPanel()
+    {
+        if (_graphsPanel == null)
+        {
+            var panel = new GraphsPanel(_project.Path);
+            panel.Notify += Log;
+            _graphsPanel = panel;
+        }
+        _graphsPanel.AttachRunner(_graphRunner);
+        return _graphsPanel;
+    }
+
+    private Control BuildViewportArea()
+    {
+        var grid = new Grid { RowDefinitions = { new RowDefinition(GridLength.Auto), new RowDefinition(new GridLength(1, GridUnitType.Star)), new RowDefinition(new GridLength(220)) } };
+
+        var toolbar = BuildViewportToolbar();
+        Grid.SetRow(toolbar, 0);
+        grid.Children.Add(toolbar);
+
         var viewport = BuildViewport();
-        var bottom = BuildBottomPanel();
-        var hierarchy = BuildHierarchyPanel();
-        var inspector = BuildInspectorPanel();
+        Grid.SetRow(viewport, 1);
+        grid.Children.Add(viewport);
 
-        hierarchy.Width = 262;
-        inspector.Width = 318;
+        return grid;
+    }
 
-        var leftCol = new Grid
+    private Control BuildViewportToolbar()
+    {
+        var tools = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3 };
+        foreach (var (ic, tool) in new[] { (Icons.MoveTool, "Select"), (Icons.MoveTool, "Move"), (Icons.Cube, "Rotate"), (Icons.Grid, "Scale") })
         {
-            RowDefinitions =
-            {
-                new RowDefinition(new GridLength(1, GridUnitType.Star)),
-                new RowDefinition(new GridLength(250)),
-            },
-            Children = { viewport, bottom },
-        };
-        Grid.SetRow(viewport, 0);
-        Grid.SetRow(bottom, 1);
+            string t = tool;
+            bool active = t == _activeTool;
+            tools.Children.Add(UiTheme.IconBtn(ic, () => { _activeTool = t; Log($"Tool: {t}"); InvalidateOverlay(); }, 15, active ? UiTheme.Cyan : null));
+        }
+        tools.Children.Add(new Border { Width = 1, Height = 16, Background = UiTheme.B(UiTheme.Border), Margin = new Thickness(6, 0), VerticalAlignment = VerticalAlignment.Center });
+        tools.Children.Add(UiTheme.IconBtn(Icons.FilePlus, () => CreateEntity("Empty Actor"), 15));
+        tools.Children.Add(UiTheme.IconBtn(Icons.Dots, () => { }, 15));
 
-        var center = new Grid
+        var right = new StackPanel
         {
-            ColumnDefinitions =
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            Margin = new Thickness(0, 0, 10, 0),
+            Children =
             {
-                new ColumnDefinition(new GridLength(1, GridUnitType.Star)),
-                new ColumnDefinition(new GridLength(1, GridUnitType.Auto)),
-                new ColumnDefinition(new GridLength(1, GridUnitType.Auto)),
-            },
-            Children = { leftCol, hierarchy, inspector },
+                new Border { Padding = new Thickness(9, 4), Cursor = new Cursor(StandardCursorType.Hand), Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Children = { UiTheme.Txt("Transform", 11, UiTheme.Dim), UiTheme.Ico(Icons.ChevronDown, 11, UiTheme.Faint) } } },
+                new Border { Padding = new Thickness(9, 4), Cursor = new Cursor(StandardCursorType.Hand), Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Children = { UiTheme.Txt("View", 11, UiTheme.Dim), UiTheme.Ico(Icons.ChevronDown, 11, UiTheme.Faint) } } },
+            }
         };
-        Grid.SetColumn(leftCol, 0);
-        Grid.SetColumn(hierarchy, 1);
-        Grid.SetColumn(inspector, 2);
+        DockPanel.SetDock(right, Dock.Right);
 
-        var inner = new Grid { RowDefinitions = { new RowDefinition(GridLength.Auto), new RowDefinition(new GridLength(1, GridUnitType.Star)) } };
-        Grid.SetRow(tabBar, 0);
-        Grid.SetRow(center, 1);
-        inner.Children.Add(tabBar);
-        inner.Children.Add(center);
+        var bar = new DockPanel { Height = 34, Margin = new Thickness(8, 4) };
+        bar.Children.Add(right);
+        bar.Children.Add(tools);
 
-        return inner;
+        return new Border { Background = UiTheme.B(UiTheme.Panel), BorderBrush = UiTheme.B(UiTheme.Border), BorderThickness = new Thickness(0, 0, 0, 1), Child = bar };
     }
 
     // ---------- Viewport ----------
@@ -707,65 +898,10 @@ public class WorkView : UserControl
         return _viewportPanel;
     }
 
-    private void SetViewMode(ViewportMode mode)
-    {
-        if (_viewMode == mode) return;
-        _viewMode = mode;
-        if (_softwareViewport != null)
-        {
-            _softwareViewport.Mode = mode;
-            _softwareViewport.InvalidateVisual();
-        }
-        Log($"View: {mode switch { ViewportMode.Game => "Game", ViewportMode.Mode2D => "2D", _ => "Scene" }}");
-        InvalidateOverlay();
-    }
-
     private Control BuildViewportOverlay()
     {
-        // top-left: Scene / Game / 2D toggle
-        var segInner = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
-        void SegBtn(string label, ViewportMode mode)
-        {
-            bool on = _viewMode == mode;
-            var b = new Button
-            {
-                Content = UiTheme.Txt(label, 11, on ? Colors.White : UiTheme.Dim, on ? FontWeight.SemiBold : FontWeight.Normal),
-                Background = on ? UiTheme.B(UiTheme.Accent) : UiTheme.B(Colors.Transparent),
-                BorderThickness = new Thickness(0),
-                CornerRadius = new CornerRadius(6),
-                Padding = new Thickness(13, 5),
-                Cursor = new Cursor(StandardCursorType.Hand),
-            };
-            b.Click += (_, _) => SetViewMode(mode);
-            segInner.Children.Add(b);
-        }
-        SegBtn("Scene", ViewportMode.Scene);
-        SegBtn("Game", ViewportMode.Game);
-        SegBtn("2D", ViewportMode.Mode2D);
-
-        var segHost = new Border { HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(12, 12, 0, 0), Background = UiTheme.B(Color.Parse("#e610172a")), CornerRadius = new CornerRadius(8), Padding = new Thickness(3), Child = segInner };
-
-        // left tool strip
-        var tools = new StackPanel { Orientation = Orientation.Vertical, Spacing = 4 };
-        foreach (var (ic, tool) in new[]
-        {
-            (Icons.MoveTool, "Move"), (Icons.Cube, "Rotate"), (Icons.Grid, "Scale"),
-            (Icons.Box, "Rect"), (Icons.Dots, "More"),
-        })
-        {
-            string t = tool;
-            bool activeTool = t == _activeTool;
-            var btn = UiTheme.IconBtn(ic, () => { _activeTool = t; Log($"Tool: {t}"); InvalidateOverlay(); }, 17,
-                activeTool ? UiTheme.Cyan : null);
-            tools.Children.Add(btn);
-        }
-        var toolsHost = new Border { HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(12, 62, 0, 0), Background = UiTheme.B(Color.Parse("#e610172a")), CornerRadius = new CornerRadius(9), Padding = new Thickness(5), Child = tools };
-
-        // top-right icon cluster
         var rightIcons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3 };
         rightIcons.Children.Add(UiTheme.IconBtn(Icons.Camera, CreateCamera, 15));
-        rightIcons.Children.Add(UiTheme.IconBtn(Icons.MoveTool, () => { _activeTool = "Move"; Log("Tool: Move"); InvalidateOverlay(); }, 15, _activeTool == "Move" ? UiTheme.Cyan : null));
-        rightIcons.Children.Add(UiTheme.IconBtn(Icons.Gear, OpenSettings, 15));
         rightIcons.Children.Add(UiTheme.IconBtn(Icons.Bulb, () =>
         {
             _showGizmos = !_showGizmos;
@@ -783,26 +919,19 @@ public class WorkView : UserControl
         rightIcons.Children.Add(UiTheme.IconBtn(Icons.Monitor, () => { _showStats = !_showStats; Log($"Stats overlay: {(_showStats ? "on" : "off")}"); InvalidateOverlay(); }, 15, _showStats ? UiTheme.Cyan : null));
         var rightHost = new Border { HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 12, 12, 0), Background = UiTheme.B(Color.Parse("#e610172a")), CornerRadius = new CornerRadius(8), Padding = new Thickness(5), Child = rightIcons };
 
-        // bottom-left projection chip (click toggles perspective/ortho in 3D)
-        string projLabel = _viewMode switch
-        {
-            ViewportMode.Mode2D => "Orthographic",
-            ViewportMode.Game => "Game Camera",
-            _ => "Perspective",
-        };
+        string projLabel = _viewMode switch { ViewportMode.Mode2D => "Orthographic", ViewportMode.Game => "Game Camera", _ => "Perspective" };
         var persp = new Border
         {
             Background = UiTheme.B(Color.Parse("#10172acc")),
             CornerRadius = new CornerRadius(7),
             Padding = new Thickness(11, 6),
             HorizontalAlignment = HorizontalAlignment.Left,
-            VerticalAlignment = VerticalAlignment.Bottom,
-            Margin = new Thickness(12, 0, 0, 12),
+            VerticalAlignment = VerticalAlignment.Top,
+            Margin = new Thickness(12, 12, 0, 0),
             Cursor = new Cursor(StandardCursorType.Hand),
             Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, Children = { UiTheme.Ico(Icons.Grid, 13, UiTheme.Cyan), UiTheme.Txt(projLabel, 11, UiTheme.Text), UiTheme.Ico(Icons.ChevronDown, 12, UiTheme.Dim) } },
         };
 
-        // bottom-right hint
         var hint = new TextBlock
         {
             Text = _viewMode == ViewportMode.Mode2D ? "LMB/MMB: Pan  |  Scroll: Zoom" : "LMB: Orbit  |  MMB: Pan  |  Scroll: Zoom",
@@ -814,8 +943,7 @@ public class WorkView : UserControl
             IsVisible = _showStats,
         };
 
-        // Root panel has no background, so empty areas pass clicks to the viewport.
-        return new Panel { Children = { segHost, toolsHost, rightHost, persp, hint } };
+        return new Panel { Children = { persp, rightHost, hint } };
     }
 
     private void InvalidateOverlay()
@@ -828,73 +956,14 @@ public class WorkView : UserControl
     }
 
     // ---------- Hierarchy ----------
-    private Control BuildHierarchyPanel()
-    {
-        _hierarchyList = new StackPanel { Spacing = 1 };
-        var scroll = new ScrollViewer { Content = _hierarchyList, Background = UiTheme.B(UiTheme.Panel) };
-
-        var header = new Border
-        {
-            Height = 34,
-            Background = UiTheme.B(UiTheme.Panel),
-            BorderBrush = UiTheme.B(UiTheme.Border),
-            BorderThickness = new Thickness(0, 0, 0, 1),
-            Padding = new Thickness(12, 0),
-            Child = new DockPanel
-            {
-                Children =
-                {
-                    UiTheme.IconBtn(Icons.Plus, () => CreateEntity("Empty Actor"), 14),
-                    new StackPanel
-                    {
-                        Orientation = Orientation.Horizontal,
-                        Spacing = 8,
-                        VerticalAlignment = VerticalAlignment.Center,
-                        Children = { UiTheme.Ico(Icons.Cube, 15, UiTheme.Cyan), UiTheme.Txt("Hierarchy", 13, UiTheme.Text, FontWeight.SemiBold) },
-                    },
-                }
-            },
-        };
-        DockPanel.SetDock(header, Dock.Right);
-
-        var search = new TextBox
-        {
-            Watermark = "Search...",
-            FontSize = 11,
-            Height = 28,
-            Margin = new Thickness(10, 8, 10, 6),
-            Background = UiTheme.B(UiTheme.Bg),
-            Foreground = UiTheme.B(UiTheme.Text),
-            BorderBrush = UiTheme.B(UiTheme.Border),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(6),
-            Padding = new Thickness(9, 4),
-        };
-        search.TextChanged += (_, _) =>
-        {
-            _hierarchySearch = search.Text ?? "";
-            RefreshHierarchy();
-        };
-
-        var panel = new DockPanel { Background = UiTheme.B(UiTheme.Panel) };
-        DockPanel.SetDock(header, Dock.Top);
-        DockPanel.SetDock(search, Dock.Top);
-        panel.Children.Add(header);
-        panel.Children.Add(search);
-        panel.Children.Add(scroll);
-
-        RefreshHierarchy();
-        return panel;
-    }
-
     private void RefreshHierarchy()
     {
+        if (_hierarchyList == null) return;
         _hierarchyList.Children.Clear();
         foreach (var entity in _scene.AllEntities)
         {
             if (entity.Parent != null) continue;
-            if (_hierarchySearch.Length > 0 &&
-                !entity.Name.Contains(_hierarchySearch, StringComparison.OrdinalIgnoreCase))
+            if (_hierarchySearch.Length > 0 && !entity.Name.Contains(_hierarchySearch, StringComparison.OrdinalIgnoreCase))
                 continue;
             _hierarchyList.Children.Add(HierItem(entity, 0));
             foreach (var child in entity.Children)
@@ -922,12 +991,7 @@ public class WorkView : UserControl
             Spacing = 8,
             Margin = new Thickness(8 + indent * 14, 0, 8, 0),
             VerticalAlignment = VerticalAlignment.Center,
-            Children =
-            {
-                UiTheme.Ico(Icons.ChevronDown, 11, UiTheme.Faint),
-                UiTheme.Ico(EntityIcon(entity), 14, sel ? UiTheme.Cyan : UiTheme.Dim),
-                name,
-            },
+            Children = { UiTheme.Ico(EntityIcon(entity), 14, sel ? UiTheme.Cyan : UiTheme.Dim), name },
         };
 
         var eye = UiTheme.IconBtn(Icons.Eye, () =>
@@ -965,39 +1029,65 @@ public class WorkView : UserControl
         return bg;
     }
 
-    // ---------- Inspector ----------
-    private Control BuildInspectorPanel()
+    // ---------- Right dock: Inspector / Signals ----------
+    private Control BuildRightPanel()
     {
-        _inspectorContent = new StackPanel { Spacing = 0 };
-        var scroll = new ScrollViewer { Content = _inspectorContent, Background = UiTheme.B(UiTheme.Panel) };
-
-        var header = new Border
+        var tabs = new StackPanel
         {
-            Height = 34,
-            Background = UiTheme.B(UiTheme.Panel),
-            BorderBrush = UiTheme.B(UiTheme.Border),
-            BorderThickness = new Thickness(0, 0, 0, 1),
-            Padding = new Thickness(12, 0),
-            Child = new StackPanel
+            Orientation = Orientation.Horizontal,
+            Height = 30,
+            Children = { DockTab("Inspector", () => { _rightTab = "Inspector"; RebuildRight(); }, () => _rightTab), DockTab("Signals", () => { _rightTab = "Signals"; RebuildRight(); }, () => _rightTab) }
+        };
+
+        var toolbar = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Height = 30,
+            Spacing = 2,
+            Margin = new Thickness(6, 0),
+            Children =
             {
-                Orientation = Orientation.Horizontal,
-                Spacing = 8,
-                VerticalAlignment = VerticalAlignment.Center,
-                Children = { UiTheme.Ico(Icons.Gear, 15, UiTheme.Cyan), UiTheme.Txt("Inspector", 13, UiTheme.Text, FontWeight.SemiBold) },
+                UiTheme.IconBtn(Icons.FilePlus, () => { }, 13),
+                UiTheme.IconBtn(Icons.FolderOutline, () => { }, 13),
+                UiTheme.IconBtn(Icons.Save, SaveProject, 13),
+                UiTheme.IconBtn(Icons.Dots, () => { }, 13),
             }
         };
 
-        var panel = new DockPanel { Background = UiTheme.B(UiTheme.Panel) };
-        DockPanel.SetDock(header, Dock.Top);
-        panel.Children.Add(header);
-        panel.Children.Add(scroll);
+        var content = new DockPanel();
+        DockPanel.SetDock(tabs, Dock.Top);
+        DockPanel.SetDock(toolbar, Dock.Top);
+        content.Children.Add(tabs);
+        content.Children.Add(toolbar);
 
-        RefreshInspector();
-        return panel;
+        if (_rightTab == "Inspector")
+        {
+            _inspectorContent = new StackPanel { Spacing = 0 };
+            var scroll = new ScrollViewer { Content = _inspectorContent, Background = UiTheme.B(UiTheme.Panel) };
+            content.Children.Add(scroll);
+            RefreshInspector();
+        }
+        else
+        {
+            content.Children.Add(new StackPanel
+            {
+                Margin = new Thickness(14, 30), Spacing = 6, HorizontalAlignment = HorizontalAlignment.Center,
+                Children = { UiTheme.Ico(Icons.Bell, 26, UiTheme.Faint), UiTheme.TxtAt("No signals for this selection.", 11, UiTheme.Faint, FontWeight.Normal, HorizontalAlignment.Center) }
+            });
+        }
+
+        return new Border { Width = 320, Background = UiTheme.B(UiTheme.Panel), BorderBrush = UiTheme.B(UiTheme.Border), BorderThickness = new Thickness(1, 0, 0, 0), Child = content };
+    }
+
+    private void RebuildRight()
+    {
+        if (_rightHost == null) return;
+        _rightHost.Content = BuildRightPanel();
     }
 
     private void RefreshInspector()
     {
+        if (_inspectorContent == null) return;
         _inspectorContent.Children.Clear();
         if (_selectedEntity == null)
         {
@@ -1006,19 +1096,13 @@ public class WorkView : UserControl
                 Spacing = 8,
                 HorizontalAlignment = HorizontalAlignment.Center,
                 Margin = new Thickness(16, 40),
-                Children =
-                {
-                    UiTheme.Ico(Icons.Box, 34, UiTheme.Faint),
-                    UiTheme.TxtAt("No actor selected", 13, UiTheme.Dim, FontWeight.Medium, HorizontalAlignment.Center),
-                    UiTheme.TxtAt("Select an actor in the Hierarchy.", 11, UiTheme.Faint, FontWeight.Normal, HorizontalAlignment.Center),
-                }
+                Children = { UiTheme.Ico(Icons.Box, 34, UiTheme.Faint), UiTheme.TxtAt("No actor selected", 13, UiTheme.Dim, FontWeight.Medium, HorizontalAlignment.Center), UiTheme.TxtAt("Select an actor in the Scene tree.", 11, UiTheme.Faint, FontWeight.Normal, HorizontalAlignment.Center) }
             });
             return;
         }
 
         var e = _selectedEntity;
 
-        // name card
         _inspectorContent.Children.Add(new Border
         {
             Background = UiTheme.B(Color.Parse("#161d33")),
@@ -1030,31 +1114,12 @@ public class WorkView : UserControl
                 Spacing = 8,
                 Children =
                 {
-                    new StackPanel
-                    {
-                        Orientation = Orientation.Horizontal,
-                        Spacing = 10,
-                        Children =
-                        {
-                            UiTheme.Ico(EntityIcon(e), 20, UiTheme.Cyan),
-                            UiTheme.Txt(e.Name, 15, UiTheme.Text, FontWeight.Bold),
-                        }
-                    },
-                    new StackPanel
-                    {
-                        Orientation = Orientation.Horizontal,
-                        Spacing = 8,
-                        Children =
-                        {
-                            MiniChip("Tag", "Player"),
-                            MiniChip("Layer", "Default"),
-                        }
-                    },
+                    new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, Children = { UiTheme.Ico(EntityIcon(e), 20, UiTheme.Cyan), UiTheme.Txt(e.Name, 15, UiTheme.Text, FontWeight.Bold) } },
+                    new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { MiniChip("Tag", "Player"), MiniChip("Layer", "Default") } },
                 }
             }
         });
 
-        // Transform
         var t = InsSection("Transform");
         var eul = e.Transform.GetEulerAngles();
         Vec3Row(t, "Position", e.Transform.Position.X, e.Transform.Position.Y, e.Transform.Position.Z);
@@ -1085,18 +1150,12 @@ public class WorkView : UserControl
             _inspectorContent.Children.Add(s);
         }
 
-        // actions
         var actions = new StackPanel
         {
             Orientation = Orientation.Horizontal,
             Spacing = 8,
             Margin = new Thickness(12, 14, 12, 20),
-            Children =
-            {
-                ActionSmall("+ Add Component", ShowAddComponentMenu, true),
-                ActionSmall("Duplicate", DuplicateSelected),
-                ActionSmall("Delete", DeleteSelected),
-            }
+            Children = { ActionSmall("+ Add Component", ShowAddComponentMenu, true), ActionSmall("Duplicate", DuplicateSelected), ActionSmall("Delete", DeleteSelected) }
         };
         _inspectorContent.Children.Add(actions);
     }
@@ -1109,12 +1168,7 @@ public class WorkView : UserControl
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(6),
             Padding = new Thickness(9, 4),
-            Child = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 7,
-                Children = { UiTheme.Txt(label, 10, UiTheme.Faint), UiTheme.Txt(value, 11, UiTheme.Text) },
-            },
+            Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, Children = { UiTheme.Txt(label, 10, UiTheme.Faint), UiTheme.Txt(value, 11, UiTheme.Text) } },
         };
 
     private static StackPanel InsSection(string title)
@@ -1126,12 +1180,7 @@ public class WorkView : UserControl
             CornerRadius = new CornerRadius(6),
             Margin = new Thickness(6, 0, 6, 6),
             Padding = new Thickness(9, 7),
-            Child = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 8,
-                Children = { UiTheme.Ico(Icons.ChevronDown, 12, UiTheme.Dim), UiTheme.Txt(title.ToUpperInvariant(), 11, UiTheme.Dim, FontWeight.SemiBold) },
-            }
+            Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { UiTheme.Ico(Icons.ChevronDown, 12, UiTheme.Dim), UiTheme.Txt(title.ToUpperInvariant(), 11, UiTheme.Dim, FontWeight.SemiBold) } }
         });
         return body;
     }
@@ -1141,11 +1190,7 @@ public class WorkView : UserControl
         section.Children.Add(new DockPanel
         {
             Margin = new Thickness(12, 3),
-            Children =
-            {
-                UiTheme.TxtAt(value, 11, UiTheme.Text, FontWeight.Medium, HorizontalAlignment.Right),
-                UiTheme.Txt(label, 11, UiTheme.Dim),
-            }
+            Children = { UiTheme.TxtAt(value, 11, UiTheme.Text, FontWeight.Medium, HorizontalAlignment.Right), UiTheme.Txt(label, 11, UiTheme.Dim) }
         });
     }
 
@@ -1167,12 +1212,7 @@ public class WorkView : UserControl
                 CornerRadius = new CornerRadius(5),
                 Padding = new Thickness(7, 4),
                 Margin = new Thickness(0, 0, 5, 0),
-                Child = new StackPanel
-                {
-                    Orientation = Orientation.Horizontal,
-                    Spacing = 7,
-                    Children = { UiTheme.Txt(axis, 10, c, FontWeight.Bold), UiTheme.Txt(val.ToString("F2"), 11, UiTheme.Text) },
-                },
+                Child = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, Children = { UiTheme.Txt(axis, 10, c, FontWeight.Bold), UiTheme.Txt(val.ToString("F2"), 11, UiTheme.Text) } },
             };
             Grid.SetColumn(cell, col);
             grid.Children.Add(cell);
@@ -1202,26 +1242,33 @@ public class WorkView : UserControl
         return b;
     }
 
-    // ---------- Bottom panel ----------
+    // ---------- Center wraps right dock too (built alongside) ----------
+    // NOTE: right dock is attached from BuildEditorRoot below.
+
+    // ---------- Bottom panel: Output / Debugger / Audio / Animation / Shader Editor ----------
     private Control BuildBottomPanel()
     {
         _bottomTabsPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
         RebuildBottomTabs();
 
+        var versionTxt = UiTheme.Txt($"{EngineConstants.Name} {EngineConstants.Version}", 10, UiTheme.Faint);
+        DockPanel.SetDock(versionTxt, Dock.Right);
+
         var clear = UiTheme.ActionButton("Clear", null, () => { _logMessages.Clear(); _consoleLog.Text = ""; });
         clear.Padding = new Thickness(11, 4);
+        clear.IsVisible = _bottomTab == "Output";
         DockPanel.SetDock(clear, Dock.Right);
 
         var head = new Border
         {
             Background = UiTheme.B(Color.Parse("#161d33")),
-            Height = 32,
+            Height = 30,
             Padding = new Thickness(8, 0),
-            Child = new DockPanel { Children = { clear, _bottomTabsPanel } },
+            Child = new DockPanel { Children = { versionTxt, clear, _bottomTabsPanel } },
         };
         DockPanel.SetDock(head, Dock.Top);
 
-        _bottomHost = new ContentControl { Content = BuildProjectBrowser() };
+        _bottomHost = new ContentControl { Content = BuildConsolePanel(), MaxHeight = 200 };
 
         var panel = new DockPanel { Background = UiTheme.B(UiTheme.Panel) };
         panel.Children.Add(head);
@@ -1232,17 +1279,14 @@ public class WorkView : UserControl
     private Control BottomTab(string name)
     {
         bool active = name == _bottomTab;
+        string icon = name switch { "Output" => Icons.Terminal, "Debugger" => Icons.Dashboard, "Audio" => Icons.Bell, "Animation" => Icons.PlayCircle, _ => Icons.Code };
         var b = new Button
         {
             Content = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
                 Spacing = 7,
-                Children =
-                {
-                    UiTheme.Ico(name switch { "Project" => Icons.Folder, "Console" => Icons.Terminal, "Scripts" => Icons.Code, "Animation" => Icons.PlayCircle, _ => Icons.Dashboard }, 13, active ? UiTheme.Cyan : UiTheme.Faint),
-                    UiTheme.Txt(name, 11, active ? UiTheme.Text : UiTheme.Faint, active ? FontWeight.SemiBold : FontWeight.Normal),
-                }
+                Children = { UiTheme.Ico(icon, 13, active ? UiTheme.Cyan : UiTheme.Faint), UiTheme.Txt(name, 11, active ? UiTheme.Text : UiTheme.Faint, active ? FontWeight.SemiBold : FontWeight.Normal) }
             },
             Background = UiTheme.B(active ? UiTheme.Panel : Colors.Transparent),
             BorderThickness = new Thickness(0),
@@ -1258,11 +1302,11 @@ public class WorkView : UserControl
         if (_bottomHost == null) return;
         _bottomHost.Content = _bottomTab switch
         {
-            "Console" => BuildConsolePanel(),
-            "Scripts" => BuildScriptsPanel(),
+            "Debugger" => BuildProfilerPanel(),
+            "Audio" => BuildPlaceholderPanel("Audio", "No audio buses configured yet."),
             "Animation" => BuildAnimationPanel(),
-            "Profiler" => BuildProfilerPanel(),
-            _ => BuildProjectBrowser(),
+            "Shader Editor" => BuildPlaceholderPanel("Shader Editor", "Select a shader asset to edit."),
+            _ => BuildConsolePanel(),
         };
         RebuildBottomTabs();
     }
@@ -1271,155 +1315,31 @@ public class WorkView : UserControl
     {
         if (_bottomTabsPanel == null) return;
         _bottomTabsPanel.Children.Clear();
-        foreach (var name in new[] { "Project", "Console", "Scripts", "Animation", "Profiler" })
+        foreach (var name in new[] { "Output", "Debugger", "Audio", "Animation", "Shader Editor" })
             _bottomTabsPanel.Children.Add(BottomTab(name));
     }
 
-    private Control BuildProjectBrowser()
+    private static Control BuildPlaceholderPanel(string title, string message) => new ScrollViewer
     {
-        // folder tree
-        var folders = new StackPanel { Spacing = 1 };
-        var root = _project.Path;
-        string[] dirs = Directory.Exists(root)
-            ? Directory.GetDirectories(root).Where(d => !d.EndsWith("bin") && !d.EndsWith("obj")).OrderBy(Path.GetFileName).ToArray()
-            : [];
-        if (dirs.Length == 0 && !string.IsNullOrEmpty(_selectedFolder) == false)
+        Background = UiTheme.B(UiTheme.Bg),
+        Content = new StackPanel
         {
-            // show project root as single node
-            folders.Children.Add(FolderRow("Assets", root, Path.GetFileName(root) == Path.GetFileName(_selectedFolder)));
+            Margin = new Thickness(16),
+            Spacing = 8,
+            Children = { UiTheme.Txt(title, 13, UiTheme.Text, FontWeight.SemiBold), UiTheme.Txt(message, 11, UiTheme.Faint) }
         }
-        foreach (var d in dirs)
-            folders.Children.Add(FolderRow(Path.GetFileName(d), d, _selectedFolder == d));
+    };
 
-        var folderScroll = new ScrollViewer { Content = folders, Width = 190, Background = UiTheme.B(UiTheme.Bg) };
-
-        // files grid
-        var current = string.IsNullOrEmpty(_selectedFolder) ? root : _selectedFolder;
-        string[] files = Directory.Exists(current) ? Directory.GetFiles(current).OrderBy(Path.GetFileName).ToArray() : Array.Empty<string>();
-        var grid = new WrapPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(12) };
-        foreach (var f in files)
-            grid.Children.Add(FileCard(f));
-
-        if (!files.Any())
-            grid.Children.Add(UiTheme.Txt("No assets in this folder.", 11, UiTheme.Faint));
-
-        var crumb = new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Spacing = 6,
-            Margin = new Thickness(14, 10, 0, 4),
-            Children =
-            {
-                UiTheme.Ico(Icons.FolderOutline, 14, UiTheme.Cyan),
-                UiTheme.Txt("Assets", 11, UiTheme.Cyan),
-                UiTheme.Ico(Icons.ChevronRight, 11, UiTheme.Faint),
-                UiTheme.Txt(string.IsNullOrEmpty(_selectedFolder) ? "Root" : Path.GetFileName(_selectedFolder), 11, UiTheme.Text),
-            }
-        };
-
-        var filesPanel = new DockPanel();
-        DockPanel.SetDock(crumb, Dock.Top);
-        filesPanel.Children.Add(crumb);
-        filesPanel.Children.Add(new ScrollViewer { Content = grid, Background = UiTheme.B(UiTheme.Bg) });
-
-        var split = new Grid { ColumnDefinitions = { new ColumnDefinition(new GridLength(190)), new ColumnDefinition(new GridLength(1, GridUnitType.Star)) } };
-        Grid.SetColumn(folderScroll, 0);
-        Grid.SetColumn(filesPanel, 1);
-        split.Children.Add(folderScroll);
-        split.Children.Add(filesPanel);
-        var splitLine = new Border { Background = UiTheme.B(UiTheme.Border), Width = 1, HorizontalAlignment = HorizontalAlignment.Left };
-        Grid.SetColumn(splitLine, 1);
-        split.Children.Add(splitLine);
-
-        return split;
-    }
-
-    private Control FolderRow(string name, string path, bool selected)
-    {
-        var row = new Border
-        {
-            Background = selected ? UiTheme.B(Color.Parse("#1c2a6b")) : UiTheme.B(Colors.Transparent),
-            Padding = new Thickness(12, 7),
-            Margin = new Thickness(5, 0),
-            CornerRadius = new CornerRadius(6),
-            Cursor = new Cursor(StandardCursorType.Hand),
-            Child = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 8,
-                Children = { UiTheme.Ico(Icons.FolderOutline, 14, selected ? UiTheme.Cyan : UiTheme.Dim), UiTheme.Txt(name, 11, selected ? UiTheme.Text : UiTheme.Dim) },
-            },
-        };
-        if (!selected)
-        {
-            row.PointerEntered += (_, _) => row.Background = UiTheme.B(Color.Parse("#151d38"));
-            row.PointerExited += (_, _) => row.Background = UiTheme.B(Colors.Transparent);
-        }
-        row.PointerPressed += (_, _) => { _selectedFolder = path; RebuildBottom(); };
-        return row;
-    }
-
-    private Control FileCard(string path)
-    {
-        var name = Path.GetFileName(path);
-        var ext = Path.GetExtension(path).ToLowerInvariant();
-        Color bg = ext switch
-        {
-            ".cs" => Color.Parse("#6a3fb5"),
-            ".json" => Color.Parse("#2f7fd0"),
-            ".obj" => Color.Parse("#2f8f5f"),
-            ".png" or ".jpg" => Color.Parse("#b57f3f"),
-            _ => Color.Parse("#3a4a70"),
-        };
-
-        var card = new Border
-        {
-            Width = 104,
-            Margin = new Thickness(0, 0, 10, 10),
-            CornerRadius = new CornerRadius(8),
-            Background = UiTheme.B(UiTheme.Card),
-            BorderBrush = UiTheme.B(UiTheme.Border),
-            BorderThickness = new Thickness(1),
-            Padding = new Thickness(8),
-            Cursor = new Cursor(StandardCursorType.Hand),
-            Child = new StackPanel
-            {
-                Spacing = 7,
-                Children =
-                {
-                    new Border
-                    {
-                        Height = 54,
-                        CornerRadius = new CornerRadius(6),
-                        Background = UiTheme.B(Color.Parse("#0d1220")),
-                        Child = UiTheme.Ico(ext == ".cs" ? Icons.Code : Icons.File, 22, bg),
-                    },
-                    new TextBlock
-                    {
-                        Text = name,
-                        FontSize = 10,
-                        Foreground = UiTheme.B(UiTheme.Text),
-                        TextTrimming = TextTrimming.CharacterEllipsis,
-                        FontFamily = UiTheme.Body,
-                    },
-                }
-            },
-        };
-        card.PointerPressed += (_, _) =>
-        {
-            if (ext == ".cs") OpenScript(path);
-            else if (ext == ".obj") ImportObjFile(path);
-            else Log($"Opened {name}");
-        };
-        return card;
-    }
-
+    private ScrollViewer? _consoleScroll;
     private Control BuildConsolePanel()
     {
-        return new ScrollViewer { Content = _consoleLog, Background = UiTheme.B(UiTheme.Bg) };
+        // Singleton: re-wrapping the same TextBlock in a fresh ScrollViewer while the
+        // old one is still attached throws "already has a visual parent".
+        _consoleScroll ??= new ScrollViewer { Content = _consoleLog, Background = UiTheme.B(UiTheme.Bg) };
+        return _consoleScroll;
     }
 
-    // ---------- Scripts panel ----------
+    // ---------- Scripts (full-panel, shown when top mode = "Script") ----------
     private string ScriptsDir => Path.Combine(_project.Path, "Scripts");
 
     private Control BuildScriptsPanel()
@@ -1427,7 +1347,6 @@ public class WorkView : UserControl
         Directory.CreateDirectory(ScriptsDir);
         var files = Directory.GetFiles(ScriptsDir, "*.cs").OrderBy(Path.GetFileName).ToArray();
 
-        // left: script file list
         var list = new StackPanel { Spacing = 2 };
         var newBtn = UiTheme.ActionButton("New Script", Icons.Plus, AddScript);
         newBtn.Padding = new Thickness(10, 5);
@@ -1457,9 +1376,8 @@ public class WorkView : UserControl
             list.Children.Add(row);
         }
 
-        var listScroll = new ScrollViewer { Content = list, Width = 190, Background = UiTheme.B(UiTheme.Bg) };
+        var listScroll = new ScrollViewer { Content = list, Width = 200, Background = UiTheme.B(UiTheme.Bg) };
 
-        // right: editor
         var editor = new TextBox
         {
             AcceptsReturn = true,
@@ -1472,14 +1390,13 @@ public class WorkView : UserControl
             BorderThickness = new Thickness(0),
             Padding = new Thickness(12),
         };
-        editor.SetValue(ScrollViewer.HorizontalScrollBarVisibilityProperty, Avalonia.Controls.Primitives.ScrollBarVisibility.Auto);
-        editor.SetValue(ScrollViewer.VerticalScrollBarVisibilityProperty, Avalonia.Controls.Primitives.ScrollBarVisibility.Auto);
+        editor.SetValue(ScrollViewer.HorizontalScrollBarVisibilityProperty, ScrollBarVisibility.Auto);
+        editor.SetValue(ScrollViewer.VerticalScrollBarVisibilityProperty, ScrollBarVisibility.Auto);
 
         string? scriptPath = _currentScriptPath;
-        if (scriptPath != null && File.Exists(scriptPath))
-            editor.Text = File.ReadAllText(scriptPath);
-        else
-            editor.Text = "// Select or create a script.\n// Scripts compile when you press Play.\n";
+        editor.Text = scriptPath != null && File.Exists(scriptPath)
+            ? File.ReadAllText(scriptPath)
+            : "// Select or create a script.\n// Scripts compile when you press Play.\n";
         _scriptEditor = editor;
 
         var toolbar = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Margin = new Thickness(12, 10, 12, 0) };
@@ -1516,10 +1433,10 @@ public class WorkView : UserControl
             BorderBrush = UiTheme.B(UiTheme.Border),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(7),
-            Child = new ScrollViewer { Content = editor, MaxHeight = 130 },
+            Child = new ScrollViewer { Content = editor },
         });
 
-        var split = new Grid { ColumnDefinitions = { new ColumnDefinition(new GridLength(190)), new ColumnDefinition(new GridLength(1, GridUnitType.Star)) } };
+        var split = new Grid { ColumnDefinitions = { new ColumnDefinition(new GridLength(200)), new ColumnDefinition(new GridLength(1, GridUnitType.Star)) } };
         Grid.SetColumn(listScroll, 0);
         Grid.SetColumn(right, 1);
         split.Children.Add(listScroll);
@@ -1533,8 +1450,9 @@ public class WorkView : UserControl
     private void OpenScript(string path)
     {
         _currentScriptPath = path;
-        _bottomTab = "Scripts";
-        RebuildBottom();
+        _topMode = "Script";
+        RebuildModeTabs();
+        RebuildCenter();
     }
 
     private void AddScript()
@@ -1596,24 +1514,12 @@ public class WorkView : UserControl
         Log($"Attached {className} to {_selectedEntity.Name}");
     }
 
-    // ---------- Animation / Profiler ----------
-    private Control BuildAnimationPanel()
+    // ---------- Animation ----------
+    private Control BuildAnimationPanel() => new ScrollViewer
     {
-        return new ScrollViewer
-        {
-            Background = UiTheme.B(UiTheme.Bg),
-            Content = new StackPanel
-            {
-                Margin = new Thickness(16),
-                Spacing = 8,
-                Children =
-                {
-                    UiTheme.Txt("Animation", 13, UiTheme.Text, FontWeight.SemiBold),
-                    UiTheme.Txt("No animation clips in this project yet.", 11, UiTheme.Faint),
-                }
-            }
-        };
-    }
+        Background = UiTheme.B(UiTheme.Bg),
+        Content = new StackPanel { Margin = new Thickness(16), Spacing = 8, Children = { UiTheme.Txt("Animation", 13, UiTheme.Text, FontWeight.SemiBold), UiTheme.Txt("No animation clips in this project yet.", 11, UiTheme.Faint) } }
+    };
 
     private Control BuildProfilerPanel()
     {
@@ -1621,20 +1527,11 @@ public class WorkView : UserControl
         return new ScrollViewer
         {
             Background = UiTheme.B(UiTheme.Bg),
-            Content = new StackPanel
-            {
-                Margin = new Thickness(16),
-                Spacing = 8,
-                Children =
-                {
-                    UiTheme.Txt("Profiler", 13, UiTheme.Text, FontWeight.SemiBold),
-                    _profilerStats,
-                }
-            }
+            Content = new StackPanel { Margin = new Thickness(16), Spacing = 8, Children = { UiTheme.Txt("Debugger", 13, UiTheme.Text, FontWeight.SemiBold), _profilerStats } }
         };
     }
 
-    // ---------- Actions ----------
+    // ---------- Project-level actions ----------
     private void NewScene()
     {
         if (_isPlaying) { Log("Stop play mode first."); return; }
@@ -1670,58 +1567,7 @@ public class WorkView : UserControl
         Log($"Settings — {EngineConstants.Name} v{EngineConstants.Version} | Renderer: {(_glViewport != null && _glViewport.IsReady ? "OpenGL" : "Software")} | Project: {_project.Path}");
     }
 
-    private void CompileScriptsSafe()
-    {
-        try { CompileScriptsNow(); }
-        catch (Exception ex) { Log($"Compile error: {ex.Message}"); }
-    }
-
-    // ---------- Status bar ----------
-    private Control BuildStatusBar()
-    {
-        _fpsText = UiTheme.Txt("FPS: 0", 11, UiTheme.Dim);
-        _entityCountText = UiTheme.Txt($"{_scene.AllEntities.Count} objects", 11, UiTheme.Dim);
-        _statusText = UiTheme.Txt("Ready", 11, UiTheme.Dim);
-
-        var left = new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Spacing = 8,
-            VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(14, 0),
-            Children = { UiTheme.Txt("Lumo Game Engine", 11, UiTheme.Faint), UiTheme.Txt("•", 11, UiTheme.Faint), UiTheme.Txt("Build the next generation", 11, UiTheme.Faint) },
-        };
-
-        var right = new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Spacing = 14,
-            VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(0, 0, 14, 0),
-            Children =
-            {
-                _statusText,
-                _fpsText,
-                _entityCountText,
-                new StackPanel
-                {
-                    Orientation = Orientation.Horizontal,
-                    Spacing = 6,
-                    Children =
-                    {
-                        new Border { Width = 7, Height = 7, CornerRadius = new CornerRadius(4), Background = UiTheme.B(UiTheme.Green) },
-                        UiTheme.Txt("Engine Ready", 11, UiTheme.Green, FontWeight.SemiBold),
-                    }
-                },
-            }
-        };
-        DockPanel.SetDock(right, Dock.Right);
-
-        var bar = new DockPanel { Height = 30, Background = UiTheme.B(UiTheme.Sidebar), Children = { right, left } };
-        return new Border { BorderBrush = UiTheme.B(UiTheme.Border), BorderThickness = new Thickness(0, 1, 0, 0), Child = bar };
-    }
-
-    // ---------- Actions ----------
+    // ---------- Entity actions ----------
     private void CreateEntity(string name)
     {
         var entity = _scene.CreateEntity(name);

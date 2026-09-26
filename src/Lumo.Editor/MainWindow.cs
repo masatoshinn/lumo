@@ -67,11 +67,12 @@ public class MainWindow : Window
         var home = new HomeView(
             onNewProject: (name) =>
             {
+                string finalName = string.IsNullOrWhiteSpace(name) ? "New Project" : name.Trim();
                 string dir = ProjectManager.ProjectsRootPath;
                 Directory.CreateDirectory(dir);
-                string sanitized = string.Concat((name ?? "New Project").Split(Path.GetInvalidFileNameChars())).Replace(" ", "_");
+                string sanitized = string.Concat(finalName.Split(Path.GetInvalidFileNameChars())).Replace(" ", "_");
                 string projectPath = Path.Combine(dir, sanitized);
-                ProjectManager.CreateProject(name ?? "New Project", "");
+                ProjectManager.CreateProject(finalName, "");
                 ShowWork(projectPath);
             },
             onOpenProject: (path) =>
