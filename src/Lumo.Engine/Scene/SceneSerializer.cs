@@ -47,6 +47,19 @@ public static class SceneSerializer
             };
         }
 
+        if (entity.SpriteRenderer != null)
+        {
+            entityData.SpriteRenderer = new SpriteRendererData
+            {
+                SpritePath = entity.SpriteRenderer.SpritePath,
+                Width = entity.SpriteRenderer.Width,
+                Height = entity.SpriteRenderer.Height,
+                SortOrder = entity.SpriteRenderer.SortOrder,
+                IsVisible = entity.SpriteRenderer.IsVisible,
+                Color = [entity.SpriteRenderer.Color.X, entity.SpriteRenderer.Color.Y, entity.SpriteRenderer.Color.Z]
+            };
+        }
+
         if (entity.Camera != null)
         {
             entityData.Camera = new CameraData
@@ -129,6 +142,24 @@ public static class SceneSerializer
                     MeshName = entityData.MeshRenderer.MeshName,
                     MaterialName = entityData.MeshRenderer.MaterialName,
                     IsVisible = entityData.MeshRenderer.IsVisible
+                };
+            }
+
+            if (entityData.SpriteRenderer != null)
+            {
+                entity.SpriteRenderer = new SpriteRendererComponent
+                {
+                    SpritePath = entityData.SpriteRenderer.SpritePath,
+                    Width = entityData.SpriteRenderer.Width,
+                    Height = entityData.SpriteRenderer.Height,
+                    SortOrder = entityData.SpriteRenderer.SortOrder,
+                    IsVisible = entityData.SpriteRenderer.IsVisible,
+                    Color = entityData.SpriteRenderer.Color.Length >= 3
+                        ? new System.Numerics.Vector3(
+                            entityData.SpriteRenderer.Color[0],
+                            entityData.SpriteRenderer.Color[1],
+                            entityData.SpriteRenderer.Color[2])
+                        : new System.Numerics.Vector3(0.47f, 0.67f, 0.94f)
                 };
             }
 

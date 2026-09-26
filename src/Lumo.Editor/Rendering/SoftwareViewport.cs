@@ -393,9 +393,18 @@ public class SoftwareViewport : Control
             gc.LineTo(new Point(e2.X, e2.Y));
             gc.EndFigure(true);
         }
+        var sc = sp.Color;
+        var fill = Color.FromRgb(
+            (byte)Math.Clamp((int)(sc.X * 255f), 0, 255),
+            (byte)Math.Clamp((int)(sc.Y * 255f), 0, 255),
+            (byte)Math.Clamp((int)(sc.Z * 255f), 0, 255));
+        var stroke = Color.FromRgb(
+            (byte)Math.Min(255, (int)(fill.R + 70)),
+            (byte)Math.Min(255, (int)(fill.G + 70)),
+            (byte)Math.Min(255, (int)(fill.B + 70)));
         ctx.DrawGeometry(
-            new SolidColorBrush(Color.FromRgb(120, 170, 240)),
-            new Pen(new SolidColorBrush(Color.FromRgb(170, 210, 255)), 1.4),
+            new SolidColorBrush(fill),
+            new Pen(new SolidColorBrush(stroke), 1.4),
             geo);
     }
 

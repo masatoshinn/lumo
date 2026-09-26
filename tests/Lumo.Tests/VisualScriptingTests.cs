@@ -25,7 +25,7 @@ public class VisualScriptingTests
     {
         var graph = NewGraph();
         build(graph);
-        Assert.Empty(GraphValidator.Validate(graph).Where(i => i.IsError));
+        Assert.DoesNotContain(GraphValidator.Validate(graph), i => i.IsError);
 
         var interp = new GraphInterpreter { Scene = scene, Input = input };
         var logs = new List<string>();
@@ -64,7 +64,7 @@ public class VisualScriptingTests
         var loadedLog = Assert.IsType<LogNode>(loaded.Nodes[1]);
         Assert.Equal("saved", loadedLog.Values["message"]);
         Assert.Equal(10, loaded.Nodes[0].X);
-        Assert.Empty(GraphValidator.Validate(loaded).Where(i => i.IsError));
+        Assert.DoesNotContain(GraphValidator.Validate(loaded), i => i.IsError);
     }
 
     [Fact]
@@ -321,5 +321,91 @@ public class VisualScriptingTests
 
         Assert.Equal(new Vector3(0, 5, 0), entity.Transform.Position);
         Assert.Empty(interp.Errors);
+    }
+
+    [Fact]
+    public void Registry_ContainsSnakeNodes()
+    {
+        Assert.True(NodeRegistry.TryGet("entity.getPosition", out _));
+        Assert.True(NodeRegistry.TryGet("math.distance", out _));
+        Assert.True(NodeRegistry.TryGet("value.random", out _));
+    }
+
+    [Fact]
+    public void Interpreter_GetPosition_Distance_BetweenEntities()
+    {
+        var scene = new Scene { Name = "VS" };
+        var head = scene.CreateEntity("Head");
+        var food = scene.CreateEntity("Food");
+        head.Transform.Position = new Vector3(1, 2, 0);
+        food.Transform.Position = new Vector3(4, 6, 0);
+
+        var (interp, logs) = Run(g =>
+        {
+            var start = Node<EventStartNode>(g);
+            var findA = Node<FindEntityNode>(g);
+            findA.Values["name"] = "Head";
+            var findB = Node<FindEntityNode>(g);
+            findB.Values["name"] = "Food";
+            var posA = Node<GetPositionNode>(g);
+            var posB = Node<GetPositionNode>(g);
+            var dist = Node<MathDistanceNode>(g);
+            var log = Node<LogNode>(g);
+            Link(g, start, "exec", log, "in");
+            Link(g, findA, "entity", posA, "entity");
+            Link(g, findB, "entity", posB, "entity");
+            Link(g, posA, "position", dist, "a");
+            Link(g, posB, "position", dist, "b");
+            Link(g, dist, "result", log, "message");
+        }, scene);
+
+        Assert.Equal(new[] { "5" }, logs);
+        Assert.Empty(interp.Errors);
+    }
+
+    [Fact]
+    public void Interpreter_RandomRange_StaysWithinBounds()
+    {
+        var (interp, logs) = Run(g =>
+        {
+            var start = Node<EventStartNode>(g);
+            var rnd = Node<RandomRangeNode>(g);
+            rnd.Values["min"] = "-2";
+            rnd.Values["max"] = "2";
+            var log = Node<LogNode>(g);
+            Link(g, start, "exec", log, "in");
+            Link(g, rnd, "value", log, "message");
+        });
+
+        Assert.Single(logs);
+        float value = float.Parse(logs[0], System.Globalization.CultureInfo.InvariantCulture);
+        Assert.InRange(value, -2f, 2f);
+        Assert.Empty(interp.Errors);
+    }
+
+    [Fact]
+    public void Scene_SpriteRenderer_SurvivesRoundtrip()
+    {
+        var scene = new Scene { Name = "Sprites" };
+        var e = scene.CreateEntity("Head");
+        e.Transform.Position = new Vector3(3, 4, 0);
+        e.SpriteRenderer = new SpriteRendererComponent
+        {
+            Width = 0.55f,
+            Height = 0.5f,
+            Color = new Vector3(0.2f, 0.8f, 0.35f),
+            IsVisible = true
+        };
+
+        string json = scene.Serialize();
+        var data = System.Text.Json.JsonSerializer.Deserialize<SceneData>(json,
+            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
+        Scene loaded = SceneSerializer.Deserialize(data);
+
+        Entity back = Assert.IsType<Entity>(loaded.FindByName("Head"));
+        Assert.NotNull(back.SpriteRenderer);
+        Assert.Equal(0.55f, back.SpriteRenderer!.Width);
+        Assert.Equal(new Vector3(0.2f, 0.8f, 0.35f), back.SpriteRenderer.Color);
+        Assert.Equal(new Vector3(3, 4, 0), back.Transform.Position);
     }
 }

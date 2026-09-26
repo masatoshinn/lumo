@@ -20,6 +20,7 @@ public sealed class SpriteRendererComponent
     public float Height { get; set; } = 1.0f;
     public int SortOrder { get; set; }
     public bool IsVisible { get; set; } = true;
+    public System.Numerics.Vector3 Color { get; set; } = new(0.47f, 0.67f, 0.94f);
 }
 
 /// <summary>

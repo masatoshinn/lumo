@@ -120,6 +120,7 @@ public sealed class EntityData
     public long Id { get; set; }
     public TransformData? Transform { get; set; }
     public MeshRendererData? MeshRenderer { get; set; }
+    public SpriteRendererData? SpriteRenderer { get; set; }
     public CameraData? Camera { get; set; }
     public LightData? Light { get; set; }
     public ScriptsData? Scripts { get; set; }
@@ -138,6 +139,16 @@ public sealed class MeshRendererData
     public string? MeshName { get; set; }
     public string? MaterialName { get; set; }
     public bool IsVisible { get; set; } = true;
+}
+
+public sealed class SpriteRendererData
+{
+    public string? SpritePath { get; set; }
+    public float Width { get; set; } = 1.0f;
+    public float Height { get; set; } = 1.0f;
+    public int SortOrder { get; set; }
+    public bool IsVisible { get; set; } = true;
+    public float[] Color { get; set; } = [0.47f, 0.67f, 0.94f];
 }
 
 public sealed class CameraData

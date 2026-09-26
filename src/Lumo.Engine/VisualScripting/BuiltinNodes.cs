@@ -274,6 +274,20 @@ public sealed class MathDivideNode : VSNode
     }
 }
 
+[GraphNode("math.distance", "Distance", "Math", "Distance between two points.")]
+public sealed class MathDistanceNode : VSNode
+{
+    public MathDistanceNode()
+    {
+        DataIn("a", PinDataType.Vector3);
+        DataIn("b", PinDataType.Vector3);
+        DataOut("result", PinDataType.Float);
+    }
+
+    public override object? EvaluateOutput(GraphContext ctx, string pin) =>
+        Vector3.Distance(ctx.Get<Vector3>(this, "a"), ctx.Get<Vector3>(this, "b"));
+}
+
 // ---------------------------------------------------------------- Logic
 
 [GraphNode("logic.compare", "Compare", "Logic", "Compares two floats (== != < <= > >=).")]
@@ -406,6 +420,24 @@ public sealed class GetSelfNode : VSNode
     public override object? EvaluateOutput(GraphContext ctx, string pin) => ctx.Self;
 }
 
+[GraphNode("value.random", "Random Range", "Values", "Random float between min and max.")]
+public sealed class RandomRangeNode : VSNode
+{
+    public RandomRangeNode()
+    {
+        DataIn("min", PinDataType.Float, "0");
+        DataIn("max", PinDataType.Float, "1");
+        DataOut("value", PinDataType.Float);
+    }
+
+    public override object? EvaluateOutput(GraphContext ctx, string pin)
+    {
+        float min = ctx.Get<float>(this, "min");
+        float max = ctx.Get<float>(this, "max");
+        return min + (float)Random.Shared.NextDouble() * (max - min);
+    }
+}
+
 // ---------------------------------------------------------------- Entity
 
 [GraphNode("entity.find", "Find Entity", "Entity", "Looks up an entity by name in the scene.")]
@@ -422,6 +454,19 @@ public sealed class FindEntityNode : VSNode
         string name = ctx.Get<string>(this, "name");
         return string.IsNullOrWhiteSpace(name) ? null : ctx.Scene?.FindByName(name);
     }
+}
+
+[GraphNode("entity.getPosition", "Get Position", "Entity", "World position of an entity.")]
+public sealed class GetPositionNode : VSNode
+{
+    public GetPositionNode()
+    {
+        DataIn("entity", PinDataType.Entity);
+        DataOut("position", PinDataType.Vector3);
+    }
+
+    public override object? EvaluateOutput(GraphContext ctx, string pin) =>
+        ctx.Get<Entity>(this, "entity") is Entity e ? e.Transform.Position : Vector3.Zero;
 }
 
 // ---------------------------------------------------------------- Variables
